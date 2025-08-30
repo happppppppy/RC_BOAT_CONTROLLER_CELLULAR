@@ -2,10 +2,8 @@ package com.example.rc_boat_controller_cellular
 
 import android.Manifest
 import android.app.*
-import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
-import android.content.IntentFilter
 import android.content.pm.PackageManager
 import android.hardware.Sensor
 import android.hardware.SensorEvent
@@ -31,7 +29,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.app.NotificationCompat
 import androidx.core.content.ContextCompat
-import androidx.lifecycle.AndroidViewModel
+import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.google.android.gms.location.LocationServices
 import com.google.android.gms.location.Priority
@@ -63,7 +61,6 @@ class MainActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
         requestPermissions()
 
-        // Start the service as soon as the app is opened
         Intent(this, BoatGatewayService::class.java).also { intent ->
             startForegroundService(intent)
         }
@@ -82,47 +79,15 @@ class MainActivity : ComponentActivity() {
             Manifest.permission.ACCESS_FINE_LOCATION,
             Manifest.permission.READ_PHONE_STATE,
             Manifest.permission.CAMERA,
-            Manifest.permission.POST_NOTIFICATIONS // Required for foreground service on newer Android
+            Manifest.permission.POST_NOTIFICATIONS
         )
         requestPermissionLauncher.launch(permissionsToRequest)
     }
 }
 
-// --- ViewModel: Holds UI state and listens for updates from the Service ---
-class BoatViewModel(application: Application) : AndroidViewModel(application) {
-
-    private val _uiState = MutableStateFlow(UiState())
-    val uiState = _uiState.asStateFlow()
-
-    private val serviceUpdateReceiver = object : BroadcastReceiver() {
-        override fun onReceive(context: Context?, intent: Intent?) {
-            intent?.let {
-                _uiState.value = UiState(
-                    usbStatus = it.getStringExtra("usbStatus") ?: _uiState.value.usbStatus,
-                    mqttStatus = it.getStringExtra("mqttStatus") ?: _uiState.value.mqttStatus,
-                    webRtcStatus = it.getStringExtra("webRtcStatus") ?: _uiState.value.webRtcStatus,
-                    lastCommand = it.getStringExtra("lastCommand") ?: _uiState.value.lastCommand,
-                    boatVoltage = it.getStringExtra("boatVoltage") ?: _uiState.value.boatVoltage,
-                    boatTacho = it.getStringExtra("boatTacho") ?: _uiState.value.boatTacho,
-                    phoneBattery = it.getStringExtra("phoneBattery") ?: _uiState.value.phoneBattery,
-                    phoneGps = it.getStringExtra("phoneGps") ?: _uiState.value.phoneGps,
-                    phoneSignal = it.getStringExtra("phoneSignal") ?: _uiState.value.phoneSignal,
-                    phoneNetworkType = it.getStringExtra("phoneNetworkType") ?: _uiState.value.phoneNetworkType,
-                    phoneHeading = it.getStringExtra("phoneHeading") ?: _uiState.value.phoneHeading
-                )
-            }
-        }
-    }
-
-    init {
-        val filter = IntentFilter(BoatGatewayService.ACTION_STATUS_UPDATE)
-        getApplication<Application>().registerReceiver(serviceUpdateReceiver, filter, Context.RECEIVER_NOT_EXPORTED)
-    }
-
-    override fun onCleared() {
-        getApplication<Application>().unregisterReceiver(serviceUpdateReceiver)
-        super.onCleared()
-    }
+// --- ViewModel: Observes the shared state from the Service ---
+class BoatViewModel : ViewModel() {
+    val uiState = BoatGatewayService.currentState.asStateFlow()
 }
 
 data class UiState(
@@ -143,6 +108,7 @@ data class UiState(
 // --- Foreground Service: Manages all connections and background tasks ---
 class BoatGatewayService : Service(), SensorEventListener {
 
+    // --- Service components ---
     private val binder = LocalBinder()
     private lateinit var sensorManager: SensorManager
     private var usbSerialPort: UsbSerialPort? = null
@@ -707,29 +673,32 @@ class BoatGatewayService : Service(), SensorEventListener {
         phoneBattery: String? = null, phoneGps: String? = null, phoneSignal: String? = null,
         phoneNetworkType: String? = null, phoneHeading: String? = null
     ) {
-        val intent = Intent(ACTION_STATUS_UPDATE).apply {
-            setPackage(packageName)
-            usbStatus?.let { putExtra("usbStatus", it) }
-            mqttStatus?.let { putExtra("mqttStatus", it) }
-            webRtcStatus?.let { putExtra("webRtcStatus", it); updateNotification("WebRTC: $it")}
-            lastCommand?.let { putExtra("lastCommand", it) }
-            boatVoltage?.let { putExtra("boatVoltage", it) }
-            boatTacho?.let { putExtra("boatTacho", it) }
-            phoneBattery?.let { putExtra("phoneBattery", it) }
-            phoneGps?.let { putExtra("phoneGps", it) }
-            phoneSignal?.let { putExtra("phoneSignal", it) }
-            phoneNetworkType?.let { putExtra("phoneNetworkType", it) }
-            phoneHeading?.let { putExtra("phoneHeading", it) }
-        }
-        sendBroadcast(intent)
+        val currentState = BoatGatewayService.currentState.value
+        BoatGatewayService.currentState.value = currentState.copy(
+            usbStatus = usbStatus ?: currentState.usbStatus,
+            mqttStatus = mqttStatus ?: currentState.mqttStatus,
+            webRtcStatus = webRtcStatus ?: currentState.webRtcStatus,
+            lastCommand = lastCommand ?: currentState.lastCommand,
+            boatVoltage = boatVoltage ?: currentState.boatVoltage,
+            boatTacho = boatTacho ?: currentState.boatTacho,
+            phoneBattery = phoneBattery ?: currentState.phoneBattery,
+            phoneGps = phoneGps ?: currentState.phoneGps,
+            phoneSignal = phoneSignal ?: currentState.phoneSignal,
+            phoneNetworkType = phoneNetworkType ?: currentState.phoneNetworkType,
+            phoneHeading = phoneHeading ?: currentState.phoneHeading
+        )
+        webRtcStatus?.let { updateNotification("WebRTC: $it") }
     }
+
 
     companion object {
         const val TAG = "BoatGatewayService"
         const val CHANNEL_ID = "BoatGatewayServiceChannel"
         const val ACTION_STOP_FROM_NOTIFICATION = "com.example.rc_boat_controller_cellular.STOP_FROM_NOTIFICATION"
-        const val ACTION_STATUS_UPDATE = "com.example.rc_boat_controller_cellular.STATUS_UPDATE"
+        const val ACTION_STATUS_UPDATE = "com.example.rc_boat_controller_cellular.STATUS_UPDATE" // Kept for future use if needed
         private const val NOTIFICATION_ID = 1
+
+        val currentState = MutableStateFlow(UiState())
     }
 }
 
@@ -739,20 +708,6 @@ class BoatGatewayService : Service(), SensorEventListener {
 fun BoatControllerScreen(viewModel: BoatViewModel = viewModel()) {
     val uiState by viewModel.uiState.collectAsState()
     val context = LocalContext.current
-
-    DisposableEffect(Unit) {
-        val usbPermissionReceiver = object : BroadcastReceiver() {
-            override fun onReceive(context: Context?, intent: Intent?) {
-                if (intent?.action == ACTION_USB_PERMISSION) {
-                    // This just ensures the broadcast is registered, the service handles connection
-                }
-            }
-        }
-        context.registerReceiver(usbPermissionReceiver, IntentFilter(ACTION_USB_PERMISSION), Context.RECEIVER_NOT_EXPORTED)
-        onDispose {
-            context.unregisterReceiver(usbPermissionReceiver)
-        }
-    }
 
     Column(
         modifier = Modifier.fillMaxSize().padding(16.dp),
@@ -766,7 +721,12 @@ fun BoatControllerScreen(viewModel: BoatViewModel = viewModel()) {
             val usbManager = context.getSystemService(Context.USB_SERVICE) as UsbManager
             val availableDrivers = UsbSerialProber.getDefaultProber().findAllDrivers(usbManager)
             if (availableDrivers.isNotEmpty()) {
-                val permissionIntent = PendingIntent.getBroadcast(context, 0, Intent(ACTION_USB_PERMISSION), PendingIntent.FLAG_IMMUTABLE)
+                val permissionIntent = PendingIntent.getBroadcast(
+                    context,
+                    0,
+                    Intent("com.android.example.USB_PERMISSION"),
+                    PendingIntent.FLAG_IMMUTABLE
+                )
                 usbManager.requestPermission(availableDrivers[0].device, permissionIntent)
             }
         }) {
@@ -858,3 +818,4 @@ open class SdpObserverAdapter : SdpObserver {
     override fun onCreateFailure(p0: String?) {}
     override fun onSetFailure(p0: String?) {}
 }
+
