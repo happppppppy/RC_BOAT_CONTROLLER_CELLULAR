@@ -29,6 +29,8 @@ android {
         buildConfigField("String", "MQTT_BROKER_HOST", "\"${localProperties.getProperty("mqtt.broker.host")}\"")
         buildConfigField("String", "MQTT_USERNAME", "\"${localProperties.getProperty("mqtt.username")}\"")
         buildConfigField("String", "MQTT_PASSWORD", "\"${localProperties.getProperty("mqtt.password")}\"")
+        buildConfigField("String", "TURN_USERNAME", "\"${localProperties.getProperty("turn.username")}\"")
+        buildConfigField("String", "TURN_PASSWORD", "\"${localProperties.getProperty("turn.password")}\"")
     }
 
     buildFeatures {
