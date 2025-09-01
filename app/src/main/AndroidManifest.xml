@@ -12,6 +12,7 @@
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC"/>
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_LOCATION"/>
     <uses-permission android:name="android.permission.CAMERA" />
+    <uses-permission android:name="android.permission.RECORD_AUDIO" />
 
     <uses-feature android:name="android.hardware.camera.any" />
     <application

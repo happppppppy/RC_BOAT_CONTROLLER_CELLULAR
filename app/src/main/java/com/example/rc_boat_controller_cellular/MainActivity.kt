@@ -52,6 +52,7 @@ import org.webrtc.*
 import java.nio.ByteBuffer
 import java.nio.charset.StandardCharsets
 import java.util.UUID
+import java.util.concurrent.atomic.AtomicBoolean
 
 // --- Main Activity: UI and Service Control ---
 class MainActivity : ComponentActivity() {
@@ -168,6 +169,8 @@ class BoatGatewayService : Service(), SensorEventListener {
     private var controlDataChannel: DataChannel? = null
     private var telemetryDataChannel: DataChannel? = null
     private var isWebRTCConnecting = false
+    private var isWebRTCDisconnecting = AtomicBoolean(false)
+
 
     inner class LocalBinder : Binder() {
         fun getService(): BoatGatewayService = this@BoatGatewayService
@@ -202,6 +205,7 @@ class BoatGatewayService : Service(), SensorEventListener {
 
     private fun stopGateway() {
         Log.d("BoatGatewayService", "Stopping Gateway Service...")
+        sendSignalingMessage(JSONObject().put("type", "bye"))
         disconnectWebRTC()
         disconnectUsb()
         disconnectMqtt()
@@ -271,6 +275,9 @@ class BoatGatewayService : Service(), SensorEventListener {
                     mqttClient?.publishWith()?.topic("rcboat/status")?.payload("online".toByteArray())?.send()
                 }
             }
+            .addDisconnectedListener {
+                updateStatus(mqttStatus = "Disconnected")
+            }
             .buildAsync()
 
         mqttClient?.connectWith()
@@ -294,10 +301,16 @@ class BoatGatewayService : Service(), SensorEventListener {
                     val message = StandardCharsets.UTF_8.decode(publish.payload.get()).toString()
                     val json = JSONObject(message)
                     when {
+                        json.has("type") && json.getString("type") == "bye" -> {
+                            disconnectWebRTC()
+                        }
                         json.has("sdp") -> {
                             val sdp = json.getString("sdp")
                             val type = SessionDescription.Type.fromCanonicalForm(json.getString("type").lowercase())
                             if (type == SessionDescription.Type.OFFER) {
+                                if (peerConnection != null) {
+                                    disconnectWebRTC()
+                                }
                                 handleOffer(SessionDescription(type, sdp))
                             }
                         }
@@ -322,8 +335,8 @@ class BoatGatewayService : Service(), SensorEventListener {
     }
 
     private fun handleOffer(offer: SessionDescription) {
-        if (isWebRTCConnecting) {
-            Log.w("BoatGatewayService", "Ignoring new offer, already connecting.")
+        if (isWebRTCConnecting || isWebRTCDisconnecting.get()) {
+            Log.w("BoatGatewayService", "Ignoring new offer, already connecting or disconnecting.")
             return
         }
         isWebRTCConnecting = true
@@ -352,21 +365,20 @@ class BoatGatewayService : Service(), SensorEventListener {
 
             override fun onDataChannel(dataChannel: DataChannel?) {
                 dataChannel?.let {
-                    when (it.label()) {
-                        "control" -> {
-                            controlDataChannel = it
-                            it.registerObserver(object : DataChannel.Observer {
-                                override fun onMessage(buffer: DataChannel.Buffer?) {
-                                    buffer?.let { b ->
-                                        val data = ByteArray(b.data.remaining())
-                                        b.data.get(data)
-                                        writeToUsb(String(data, StandardCharsets.UTF_8))
-                                    }
+                    if (it.label() == "control") {
+                        controlDataChannel = it
+                        it.registerObserver(object : DataChannel.Observer {
+                            override fun onMessage(buffer: DataChannel.Buffer?) {
+                                buffer?.let { b ->
+                                    val data = ByteArray(b.data.remaining())
+                                    b.data.get(data)
+                                    val command = String(data, StandardCharsets.UTF_8)
+                                    writeToUsb(command)
                                 }
-                                override fun onBufferedAmountChange(p0: Long) {}
-                                override fun onStateChange() {}
-                            })
-                        }
+                            }
+                            override fun onBufferedAmountChange(p0: Long) {}
+                            override fun onStateChange() {}
+                        })
                     }
                 }
             }
@@ -375,9 +387,9 @@ class BoatGatewayService : Service(), SensorEventListener {
                 updateStatus(webRtcStatus = newState?.name ?: "UNKNOWN")
                 if(newState == PeerConnection.IceConnectionState.CONNECTED) {
                     isWebRTCConnecting = false
-                    startPhoneTelemetryJob() // Start sending telemetry via data channel
+                    startPhoneTelemetryJob()
                 }
-                if(newState == PeerConnection.IceConnectionState.FAILED || newState == PeerConnection.IceConnectionState.DISCONNECTED || newState == PeerConnection.IceConnectionState.CLOSED) {
+                if(newState == PeerConnection.IceConnectionState.FAILED || newState == PeerConnection.IceConnectionState.CLOSED) {
                     isWebRTCConnecting = false
                     disconnectWebRTC()
                 }
@@ -396,7 +408,11 @@ class BoatGatewayService : Service(), SensorEventListener {
 
         if (ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED) {
             setupCameraTrack()
-            videoTrack?.let { peerConnection?.addTrack(it) }
+            videoTrack?.let {
+                if (peerConnection?.connectionState() != PeerConnection.PeerConnectionState.CLOSED) {
+                    peerConnection?.addTrack(it)
+                }
+            }
         }
 
         telemetryDataChannel = peerConnection?.createDataChannel("telemetry", DataChannel.Init())
@@ -418,35 +434,62 @@ class BoatGatewayService : Service(), SensorEventListener {
 
     private fun setupCameraTrack() {
         val cameraEnumerator = Camera2Enumerator(this)
-        val deviceName = cameraEnumerator.deviceNames.firstOrNull { !cameraEnumerator.isFrontFacing(it) } // Prefer back camera
+        val deviceName = cameraEnumerator.deviceNames.firstOrNull { !cameraEnumerator.isFrontFacing(it) }
             ?: cameraEnumerator.deviceNames.first()
 
         videoCapturer = cameraEnumerator.createCapturer(deviceName, null)
+        if (videoCapturer == null) {
+            Log.e("BoatGatewayService", "Failed to create camera capturer.")
+            disconnectWebRTC()
+            return
+        }
+
         videoSource = peerConnectionFactory.createVideoSource(videoCapturer!!.isScreencast)
-
         videoCapturer!!.initialize(SurfaceTextureHelper.create("CaptureThread", eglBase.eglBaseContext), this, videoSource!!.capturerObserver)
-        videoCapturer!!.startCapture(640, 480, 15) // Reduced quality
-
+        videoCapturer!!.startCapture(640, 480, 15)
         videoTrack = peerConnectionFactory.createVideoTrack("videoTrack", videoSource)
     }
 
     private fun disconnectWebRTC() {
-        phoneTelemetryJob?.cancel()
-        peerConnection?.close()
-        peerConnection = null
-        videoCapturer?.stopCapture()
-        videoCapturer?.dispose()
-        videoCapturer = null
-        videoSource?.dispose()
-        videoSource = null
-        isWebRTCConnecting = false
-        updateStatus(webRtcStatus = "Idle")
-    }
+        if (isWebRTCDisconnecting.getAndSet(true)) {
+            Log.d("BoatGatewayService", "disconnectWebRTC already in progress.")
+            return
+        }
+        Log.d("BoatGatewayService", "Disconnecting WebRTC...")
 
+        phoneTelemetryJob?.cancel()
+        phoneTelemetryJob = null
+
+        serviceScope.launch(Dispatchers.IO) {
+            try {
+                videoCapturer?.stopCapture()
+                Log.d("BoatGatewayService", "Video capturer stopped.")
+            } catch (e: Exception) {
+                Log.e("BoatGatewayService", "Error stopping video capturer", e)
+            }
+
+            peerConnection?.close()
+            Log.d("BoatGatewayService", "Peer connection closed.")
+
+            videoCapturer?.dispose()
+            videoSource?.dispose()
+
+            peerConnection = null
+            videoCapturer = null
+            videoSource = null
+            videoTrack = null
+            controlDataChannel = null
+            telemetryDataChannel = null
+
+            isWebRTCConnecting = false
+            updateStatus(webRtcStatus = "Idle")
+            Log.d("BoatGatewayService", "WebRTC Disconnected.")
+            isWebRTCDisconnecting.set(false)
+        }
+    }
 
     private fun disconnectMqtt() {
         mqttClient?.disconnect()
-        updateStatus(mqttStatus = "Disconnected")
     }
 
     private fun startPhoneTelemetryJob() {
