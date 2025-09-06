@@ -1,4 +1,4 @@
-package com.example.rc_boat_controller_cellular // Change this to your actual package name
+package com.example.rc_boat_controller_cellular
 
 import android.Manifest
 import android.app.*
@@ -13,8 +13,6 @@ import android.hardware.SensorEventListener
 import android.hardware.SensorManager
 import android.hardware.usb.UsbManager
 import android.location.Location
-import android.net.ConnectivityManager
-import android.net.Network
 import android.os.*
 import android.telephony.TelephonyManager
 import android.util.Log
@@ -27,6 +25,7 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -39,93 +38,68 @@ import com.google.android.gms.location.Priority
 import com.google.android.gms.tasks.CancellationTokenSource
 import com.hivemq.client.mqtt.MqttClient
 import com.hivemq.client.mqtt.mqtt5.Mqtt5AsyncClient
-import com.hivemq.client.mqtt.mqtt5.message.publish.Mqtt5Publish
+import com.hoho.android.usbserial.driver.UsbSerialDriver
 import com.hoho.android.usbserial.driver.UsbSerialPort
 import com.hoho.android.usbserial.driver.UsbSerialProber
-import kotlinx.coroutines.*
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.launch
 import org.json.JSONObject
 import org.webrtc.*
 import java.nio.ByteBuffer
 import java.nio.charset.StandardCharsets
 import java.util.UUID
-import java.util.concurrent.atomic.AtomicLong
 
-// --- Main Activity: Manages Permissions and starts the Service ---
+// --- Main Activity: UI and Service Control ---
 class MainActivity : ComponentActivity() {
-
     private val requestPermissionLauncher =
-        registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { permissions ->
-            if (permissions.all { it.value }) {
-                startGatewayService()
-            }
-        }
+        registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-
-        if (hasAllPermissions()) {
-            startGatewayService()
-        } else {
-            requestPermissions()
-        }
+        requestPermissions()
 
         setContent {
             RCBoatControllerTheme {
                 Surface(modifier = Modifier.fillMaxSize(), color = MaterialTheme.colorScheme.background) {
-                    BoatStatusScreen()
+                    BoatControllerScreen()
                 }
             }
         }
-    }
 
-    private fun hasAllPermissions(): Boolean {
-        return PERMISSIONS.all {
-            ContextCompat.checkSelfPermission(this, it) == PackageManager.PERMISSION_GRANTED
+        // Start the service as soon as the app is opened
+        Intent(this, BoatGatewayService::class.java).also { intent ->
+            startForegroundService(intent)
         }
+
+
     }
 
     private fun requestPermissions() {
-        requestPermissionLauncher.launch(PERMISSIONS)
-    }
-
-    private fun startGatewayService() {
-        val usbManager = getSystemService(Context.USB_SERVICE) as UsbManager
-        val availableDrivers = UsbSerialProber.getDefaultProber().findAllDrivers(usbManager)
-        if (availableDrivers.isNotEmpty()) {
-            val device = availableDrivers[0].device
-            if (!usbManager.hasPermission(device)) {
-                val permissionIntent = PendingIntent.getBroadcast(this, 0, Intent(ACTION_USB_PERMISSION), PendingIntent.FLAG_IMMUTABLE)
-                usbManager.requestPermission(device, permissionIntent)
-            }
-        }
-
-        val serviceIntent = Intent(this, BoatGatewayService::class.java)
-        startForegroundService(serviceIntent)
-    }
-
-    companion object {
-        private val PERMISSIONS = arrayOf(
+        val permissionsToRequest = arrayOf(
             Manifest.permission.ACCESS_FINE_LOCATION,
             Manifest.permission.READ_PHONE_STATE,
             Manifest.permission.CAMERA,
-            Manifest.permission.ACCESS_NETWORK_STATE
+            Manifest.permission.POST_NOTIFICATIONS // Required for foreground service on newer Android
         )
-        const val ACTION_USB_PERMISSION = "com.example.rc_boat_controller_cellular.USB_PERMISSION"
+        requestPermissionLauncher.launch(permissionsToRequest)
     }
 }
 
-
-// --- ViewModel: Holds UI state ---
+// --- ViewModel: Holds UI state and listens for updates from the Service ---
 class BoatViewModel(application: Application) : AndroidViewModel(application) {
+
     private val _uiState = MutableStateFlow(UiState())
     val uiState = _uiState.asStateFlow()
 
     private val serviceUpdateReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context?, intent: Intent?) {
             intent?.let {
-                val newState = UiState(
+                _uiState.value = UiState(
                     usbStatus = it.getStringExtra("usbStatus") ?: _uiState.value.usbStatus,
                     mqttStatus = it.getStringExtra("mqttStatus") ?: _uiState.value.mqttStatus,
                     webRtcStatus = it.getStringExtra("webRtcStatus") ?: _uiState.value.webRtcStatus,
@@ -138,7 +112,6 @@ class BoatViewModel(application: Application) : AndroidViewModel(application) {
                     phoneNetworkType = it.getStringExtra("phoneNetworkType") ?: _uiState.value.phoneNetworkType,
                     phoneHeading = it.getStringExtra("phoneHeading") ?: _uiState.value.phoneHeading
                 )
-                _uiState.value = newState
             }
         }
     }
@@ -168,149 +141,178 @@ data class UiState(
     val phoneHeading: String = "---°"
 )
 
+
 // --- Foreground Service: Manages all connections and background tasks ---
 class BoatGatewayService : Service(), SensorEventListener {
+
+    private val binder = LocalBinder()
     private lateinit var sensorManager: SensorManager
     private var usbSerialPort: UsbSerialPort? = null
     private var mqttClient: Mqtt5AsyncClient? = null
-    private var serviceJob = Job()
-    private val serviceScope = CoroutineScope(Dispatchers.IO + serviceJob)
-
-    @OptIn(ExperimentalCoroutinesApi::class)
-    private val webRtcScope = CoroutineScope(Dispatchers.IO.limitedParallelism(1) + Job())
-
-    private var phoneTelemetryJob: Job? = null
-    private var mqttHeartbeatJob: Job? = null
-    private var baseHeartbeatMonitorJob: Job? = null
-    private val lastBaseHeartbeatTime = AtomicLong(0)
-
-
+    private var serviceJob: Job? = null
+    private var usbReadJob: Job? = null
     private var gravity: FloatArray? = null
     private var geomagnetic: FloatArray? = null
     private var lastGpsFixTime: Long = 0
-    private var currentHeading: Int = 0
+    private var currentPhoneHeading: String = "---°"
 
-    // WebRTC Components
+    // --- Status Variables ---
+    private var currentUsbStatus: String = "Disconnected"
+    private var currentMqttStatus: String = "Disconnected"
+    private var currentWebRtcStatus: String = "Idle"
+    private var currentLastCommand: String = "None"
+
+    // --- WebRTC Components ---
     private val eglBase = EglBase.create()
     private val peerConnectionFactory: PeerConnectionFactory by lazy {
         PeerConnectionFactory.initialize(PeerConnectionFactory.InitializationOptions.builder(this).createInitializationOptions())
         PeerConnectionFactory.builder()
-            .setVideoEncoderFactory(DefaultVideoEncoderFactory(eglBase.eglBaseContext, true, true))
             .setVideoDecoderFactory(DefaultVideoDecoderFactory(eglBase.eglBaseContext))
+            .setVideoEncoderFactory(DefaultVideoEncoderFactory(eglBase.eglBaseContext, true, true))
             .createPeerConnectionFactory()
     }
     private var peerConnection: PeerConnection? = null
     private var videoCapturer: CameraVideoCapturer? = null
-    private var videoSource: VideoSource? = null
-    private var videoTrack: VideoTrack? = null
     private var controlDataChannel: DataChannel? = null
     private var telemetryDataChannel: DataChannel? = null
+    private var isWebRTCActive = false
 
-    // Network State Receiver
-    private lateinit var connectivityManager: ConnectivityManager
-    private val networkCallback = object : ConnectivityManager.NetworkCallback() {
-        override fun onAvailable(network: Network) {
-            super.onAvailable(network)
-            Log.i("BoatGatewayService", "Network connection available. Re-establishing connections.")
-            if (mqttClient == null || mqttClient?.state?.isConnected == false) {
-                connectMqtt()
-            }
-        }
 
-        override fun onLost(network: Network) {
-            super.onLost(network)
-            Log.w("BoatGatewayService", "Network connection lost. Tearing down all connections.")
-            disconnectAndCleanup()
-        }
+    inner class LocalBinder : Binder() {
+        fun getService(): BoatGatewayService = this@BoatGatewayService
     }
 
-    override fun onBind(intent: Intent?): IBinder? = null
+    override fun onBind(intent: Intent?): IBinder = binder
 
     override fun onCreate() {
         super.onCreate()
-        Log.d("BoatGatewayService", "Service onCreate")
+        Log.d(TAG, "Service onCreate")
         sensorManager = getSystemService(Context.SENSOR_SERVICE) as SensorManager
-        connectivityManager = getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
-        connectivityManager.registerDefaultNetworkCallback(networkCallback)
         createNotificationChannel()
         startGateway()
     }
 
+    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        if (intent?.action == ACTION_STOP_FROM_NOTIFICATION) {
+            stopGateway()
+        }
+        return START_STICKY
+    }
+
     override fun onDestroy() {
-        connectivityManager.unregisterNetworkCallback(networkCallback)
         stopGateway()
         super.onDestroy()
     }
 
-    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        return START_STICKY
-    }
-
     private fun startGateway() {
-        Log.d("BoatGatewayService", "Starting Gateway Service...")
-        startForeground(NOTIFICATION_ID, createNotification())
-        startSensorListeners()
-        connectUsb()
-        connectMqtt()
+        Log.d(TAG, "Starting Gateway Service...")
+        startForeground(NOTIFICATION_ID, createNotification("Initializing..."))
+
+        serviceJob = CoroutineScope(Dispatchers.IO).launch {
+            connectMqtt()
+            startSensorListeners()
+            launch { periodicUsbCheck() }
+            launch { periodicTelemetryUpdate() }
+        }
+
+        Log.d(TAG, "Gateway Service Started")
     }
 
     private fun stopGateway() {
-        Log.d("BoatGatewayService", "Stopping Gateway Service...")
-        sendSignalingMessage(JSONObject().put("type", "bye"))
-        disconnectAndCleanup()
-        serviceJob.cancel()
-        webRtcScope.cancel()
+        Log.d(TAG, "Stopping Gateway Service...")
+        serviceJob?.cancel()
+        disconnectUsb()
+        disconnectMqtt()
+        stopSensorListeners()
+        cleanupWebRTC()
         stopForeground(true)
         stopSelf()
+        Log.d(TAG, "Gateway Service Stopped")
     }
 
-    private fun disconnectAndCleanup() {
-        webRtcScope.launch {
-            disconnectWebRTC()
-            disconnectMqtt()
+    // --- Connection and Telemetry Logic ---
+    private suspend fun periodicUsbCheck() {
+        val usbManager = getSystemService(Context.USB_SERVICE) as UsbManager
+        while (true) {
+            if (usbSerialPort == null || usbSerialPort?.isOpen == false) {
+                val availableDrivers = UsbSerialProber.getDefaultProber().findAllDrivers(usbManager)
+                if (availableDrivers.isNotEmpty()) {
+                    val driver = availableDrivers[0]
+                    if (usbManager.hasPermission(driver.device)) {
+                        connectUsb(usbManager, driver)
+                    } else {
+                        updateStatus(usbStatus = "Permission Needed")
+                    }
+                } else {
+                    updateStatus(usbStatus = "Disconnected")
+                }
+            }
+            delay(5000) // Check every 5 seconds
         }
     }
 
-    private fun connectUsb() {
-        val usbManager = getSystemService(Context.USB_SERVICE) as UsbManager
-        val availableDrivers = UsbSerialProber.getDefaultProber().findAllDrivers(usbManager)
-        if (availableDrivers.isEmpty()) {
-            updateStatus(usbStatus = "No USB device found")
+    private fun connectUsb(usbManager: UsbManager, driver: UsbSerialDriver) {
+        val connection = usbManager.openDevice(driver.device)
+        if (connection == null) {
+            updateStatus(usbStatus = "Failed to open device")
             return
         }
-        val driver = availableDrivers[0]
+
+        usbSerialPort = driver.ports[0]
         try {
-            val connection = usbManager.openDevice(driver.device)
-            if (connection == null) {
-                updateStatus(usbStatus = "USB permission needed")
-                return
-            }
-            usbSerialPort = driver.ports[0]
             usbSerialPort?.open(connection)
             usbSerialPort?.setParameters(115200, 8, UsbSerialPort.STOPBITS_1, UsbSerialPort.PARITY_NONE)
             updateStatus(usbStatus = "Connected")
+            startReadingUsbData()
         } catch (e: Exception) {
             updateStatus(usbStatus = "Error: ${e.message}")
             disconnectUsb()
         }
     }
 
+    private fun startReadingUsbData() {
+        usbReadJob?.cancel()
+        usbReadJob = CoroutineScope(Dispatchers.IO).launch {
+            val buffer = ByteArray(1024)
+            var lineBuffer = ""
+            while (usbSerialPort?.isOpen == true) {
+                try {
+                    val len = usbSerialPort?.read(buffer, 200) ?: 0
+                    if (len > 0) {
+                        lineBuffer += String(buffer, 0, len)
+                        while (lineBuffer.contains("\n")) {
+                            val line = lineBuffer.substringBefore("\n").trim()
+                            lineBuffer = lineBuffer.substringAfter("\n")
+                            parseAndSendStmTelemetry(line)
+                        }
+                    }
+                } catch (e: Exception) {
+                    updateStatus(usbStatus = "Disconnected")
+                    break
+                }
+            }
+        }
+    }
+
     private fun writeToUsb(data: String) {
-        if (usbSerialPort?.isOpen == false) return
-        serviceScope.launch {
-            try {
-                usbSerialPort?.write(data.toByteArray(), 500)
-                updateStatus(lastCommand = data.trim())
-            } catch (e: Exception) {
-                updateStatus(usbStatus = "Write Error")
+        if (usbSerialPort?.isOpen == true) {
+            CoroutineScope(Dispatchers.IO).launch {
+                try {
+                    usbSerialPort?.write(data.toByteArray(), 500)
+                    updateStatus(lastCommand = data.trim())
+                } catch (e: Exception) {
+                    updateStatus(usbStatus = "Write Error")
+                }
             }
         }
     }
 
     private fun disconnectUsb() {
-        try { usbSerialPort?.close() } catch (_: Exception) {}
+        usbReadJob?.cancel()
+        try {
+            usbSerialPort?.close()
+        } catch (_: Exception) {}
         usbSerialPort = null
-        updateStatus(usbStatus = "Disconnected")
     }
 
     private fun connectMqtt() {
@@ -323,295 +325,127 @@ class BoatGatewayService : Service(), SensorEventListener {
             .serverHost(BuildConfig.MQTT_BROKER_HOST)
             .serverPort(8883)
             .sslWithDefaultConfig()
+            .automaticReconnectWithDefaultConfig()
+            .addConnectedListener {
+                Log.d(TAG, "MQTT reconnected, sending hello.")
+                updateStatus(mqttStatus = "Connected")
+                subscribeToSignaling()
+                sendSignalingMessage(JSONObject().put("type", "hello"))
+            }
+            .addDisconnectedListener {
+                Log.d(TAG, "MQTT disconnected.")
+                cleanupWebRTC()
+            }
             .buildAsync()
 
-        mqttClient?.connectWith()?.simpleAuth()
+        mqttClient?.connectWith()
+            ?.simpleAuth()
             ?.username(BuildConfig.MQTT_USERNAME)
             ?.password(BuildConfig.MQTT_PASSWORD.toByteArray())
             ?.applySimpleAuth()
             ?.send()
             ?.whenComplete { _, throwable: Throwable? ->
                 if (throwable != null) {
+                    Log.w(TAG, "MQTT failed.")
                     updateStatus(mqttStatus = "Failed: ${throwable.message}")
                 } else {
+                    Log.d(TAG, "MQTT connected.")
                     updateStatus(mqttStatus = "Connected")
-                    subscribeToTopics()
-                    startMqttHeartbeat()
-                    startBaseHeartbeatMonitor()
                 }
             }
     }
 
-    private fun startMqttHeartbeat() {
-        mqttHeartbeatJob?.cancel()
-        mqttHeartbeatJob = serviceScope.launch {
-            while(true) {
-                if (mqttClient?.state?.isConnected == true) {
-                    mqttClient?.publishWith()?.topic("rcboat/heartbeat/boat_to_base")?.payload("thump".toByteArray())?.send()
-                }
-                delay(500)
-            }
+    private fun sendDataChannelTelemetry(topic: String, payload: String) {
+        if (telemetryDataChannel?.state() == DataChannel.State.OPEN) {
+            val message = "$topic:$payload"
+            val buffer = ByteBuffer.wrap(message.toByteArray(StandardCharsets.UTF_8))
+            telemetryDataChannel?.send(DataChannel.Buffer(buffer, false))
         }
-    }
-
-    private fun startBaseHeartbeatMonitor() {
-        baseHeartbeatMonitorJob?.cancel()
-        baseHeartbeatMonitorJob = serviceScope.launch {
-            while(true) {
-                val timeSinceLastBeat = System.currentTimeMillis() - lastBaseHeartbeatTime.get()
-                if (timeSinceLastBeat > 2000) { // 2 second timeout
-                    Log.w("BoatGatewayService", "Base station heartbeat lost. Tearing down WebRTC.")
-                    webRtcScope.launch { disconnectWebRTC() }
-                }
-                delay(1000)
-            }
-        }
-    }
-
-    private fun subscribeToTopics() {
-        // Signaling Topic
-        mqttClient?.subscribeWith()
-            ?.topicFilter("rcboat/signaling/base_to_boat")
-            ?.callback { publish: Mqtt5Publish ->
-                if (publish.payload.isPresent) {
-                    val message = StandardCharsets.UTF_8.decode(publish.payload.get()).toString()
-                    val json = JSONObject(message)
-                    webRtcScope.launch {
-                        when {
-                            json.has("type") && json.getString("type") == "bye" -> disconnectWebRTC()
-                            json.has("sdp") -> {
-                                val sdp = json.getString("sdp")
-                                val type = SessionDescription.Type.fromCanonicalForm(json.getString("type").lowercase())
-                                if (type == SessionDescription.Type.OFFER) handleOffer(SessionDescription(type, sdp))
-                            }
-                            json.has("candidate") -> {
-                                val candidate = IceCandidate(
-                                    json.getString("sdpMid"),
-                                    json.getInt("sdpMLineIndex"),
-                                    json.getString("candidate")
-                                )
-                                peerConnection?.addIceCandidate(candidate)
-                            }
-                        }
-                    }
-                }
-            }
-            ?.send()
-
-        // Base Station Heartbeat Topic
-        mqttClient?.subscribeWith()
-            ?.topicFilter("rcboat/heartbeat/base_to_boat")
-            ?.callback {
-                lastBaseHeartbeatTime.set(System.currentTimeMillis())
-            }
-            ?.send()
-    }
-
-
-    private fun sendSignalingMessage(message: JSONObject) {
-        if (mqttClient?.state?.isConnected == true) {
-            mqttClient?.publishWith()?.topic("rcboat/signaling/boat_to_base")?.payload(message.toString().toByteArray())?.send()
-        }
-    }
-
-    private fun handleOffer(offer: SessionDescription) {
-        if (peerConnection != null) {
-            Log.w("BoatGatewayService", "Offer received but connection already exists. Rejecting.")
-            sendSignalingMessage(JSONObject().put("type", "busy"))
-            return
-        }
-
-        updateStatus(webRtcStatus = "Handshake...")
-        val iceServers = listOf(
-            PeerConnection.IceServer.builder("stun:stun.l.google.com:19302").createIceServer(),
-            PeerConnection.IceServer.builder("turn:global.turn.twilio.com:3478?transport=udp")
-                .setUsername(BuildConfig.TURN_USERNAME)
-                .setPassword(BuildConfig.TURN_PASSWORD)
-                .createIceServer()
-        )
-        val rtcConfig = PeerConnection.RTCConfiguration(iceServers).apply { sdpSemantics = PeerConnection.SdpSemantics.UNIFIED_PLAN }
-
-        peerConnection = peerConnectionFactory.createPeerConnection(rtcConfig, object : PeerConnection.Observer {
-            override fun onIceCandidate(candidate: IceCandidate?) {
-                webRtcScope.launch {
-                    candidate?.let { sendSignalingMessage(JSONObject().apply {
-                        put("candidate", it.sdp)
-                        put("sdpMid", it.sdpMid)
-                        put("sdpMLineIndex", it.sdpMLineIndex)
-                    })}
-                }
-            }
-            override fun onDataChannel(dataChannel: DataChannel?) {
-                dataChannel?.let {
-                    if (it.label() == "control") {
-                        controlDataChannel = it
-                        it.registerObserver(object : DataChannel.Observer {
-                            override fun onMessage(buffer: DataChannel.Buffer?) {
-                                buffer?.let { b ->
-                                    val data = ByteArray(b.data.remaining())
-                                    b.data.get(data)
-                                    writeToUsb(String(data, StandardCharsets.UTF_8))
-                                }
-                            }
-                            override fun onBufferedAmountChange(p0: Long) {}
-                            override fun onStateChange() {}
-                        })
-                    }
-                }
-            }
-
-            override fun onConnectionChange(newState: PeerConnection.PeerConnectionState?) {
-                updateStatus(webRtcStatus = newState?.name ?: "UNKNOWN")
-                when(newState) {
-                    PeerConnection.PeerConnectionState.CONNECTED -> {
-                        startPhoneTelemetryJob()
-                    }
-                    PeerConnection.PeerConnectionState.FAILED, PeerConnection.PeerConnectionState.CLOSED -> {
-                        Log.w("BoatGatewayService", "WebRTC connection definitively failed or closed. Tearing down.")
-                        webRtcScope.launch { disconnectWebRTC() }
-                    }
-                    else -> { /* No action needed */ }
-                }
-            }
-
-            override fun onIceConnectionChange(newState: PeerConnection.IceConnectionState?) {
-                Log.d("BoatGatewayService", "ICE Connection State: ${newState?.name}")
-            }
-
-            override fun onSignalingChange(p0: PeerConnection.SignalingState?) {}
-            override fun onIceConnectionReceivingChange(p0: Boolean) {}
-            override fun onIceGatheringChange(p0: PeerConnection.IceGatheringState?) {}
-            override fun onIceCandidatesRemoved(p0: Array<out IceCandidate>?) {}
-            override fun onAddStream(p0: MediaStream?) {}
-            override fun onRemoveStream(p0: MediaStream?) {}
-            override fun onAddTrack(p0: RtpReceiver?, p1: Array<out MediaStream>?) {}
-            override fun onRenegotiationNeeded() {}
-        })
-
-        if (ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED) {
-            setupCameraTrack()
-            videoTrack?.let { peerConnection?.addTrack(it, listOf("stream1")) }
-        }
-
-        telemetryDataChannel = peerConnection?.createDataChannel("telemetry", DataChannel.Init())
-        peerConnection?.setRemoteDescription(SdpObserverAdapter(), offer)
-        peerConnection?.createAnswer(object : SdpObserverAdapter() {
-            override fun onCreateSuccess(answer: SessionDescription?) {
-                peerConnection?.setLocalDescription(SdpObserverAdapter(), answer)
-                answer?.let { sendSignalingMessage(JSONObject().apply {
-                    put("type", it.type.canonicalForm())
-                    put("sdp", it.description)
-                })}
-            }
-        }, MediaConstraints())
-    }
-
-    private fun setupCameraTrack() {
-        val cameraEnumerator = Camera2Enumerator(this)
-        val deviceName = cameraEnumerator.deviceNames.firstOrNull { !cameraEnumerator.isFrontFacing(it) } ?: cameraEnumerator.deviceNames.first()
-        videoCapturer = cameraEnumerator.createCapturer(deviceName, null)
-        if (videoCapturer == null) {
-            webRtcScope.launch { disconnectWebRTC() }
-            return
-        }
-        videoSource = peerConnectionFactory.createVideoSource(videoCapturer!!.isScreencast)
-        videoCapturer!!.initialize(SurfaceTextureHelper.create("CaptureThread", eglBase.eglBaseContext), this, videoSource!!.capturerObserver)
-        videoCapturer!!.startCapture(640, 480, 15)
-        videoTrack = peerConnectionFactory.createVideoTrack("videoTrack", videoSource)
-    }
-
-    private fun disconnectWebRTC() {
-        if (peerConnection == null) return
-        Log.d("BoatGatewayService", "Disconnecting WebRTC...")
-        phoneTelemetryJob?.cancel()
-        phoneTelemetryJob = null
-        try { videoCapturer?.stopCapture() } catch (e: Exception) { Log.e("BoatGatewayService", "Error stopping video capturer", e) }
-        peerConnection?.close()
-        videoCapturer?.dispose()
-        videoSource?.dispose()
-        peerConnection = null
-        videoCapturer = null
-        videoSource = null
-        videoTrack = null
-        controlDataChannel = null
-        telemetryDataChannel = null
-        updateStatus(webRtcStatus = "Idle")
-        Log.d("BoatGatewayService", "WebRTC Disconnected.")
     }
 
     private fun disconnectMqtt() {
-        mqttHeartbeatJob?.cancel()
-        baseHeartbeatMonitorJob?.cancel()
         mqttClient?.disconnect()
-        mqttClient = null
     }
 
-    private fun startPhoneTelemetryJob() {
-        val fusedLocationClient = LocationServices.getFusedLocationProviderClient(this)
-        phoneTelemetryJob?.cancel()
-        phoneTelemetryJob = serviceScope.launch {
-            while (true) {
-                val bm = getSystemService(Context.BATTERY_SERVICE) as BatteryManager
-                val batLevel = bm.getIntProperty(BatteryManager.BATTERY_PROPERTY_CAPACITY)
-                updateAndPublish("phone:battery", batLevel.toString())
-
-                if (ContextCompat.checkSelfPermission(this@BoatGatewayService, Manifest.permission.READ_PHONE_STATE) == PackageManager.PERMISSION_GRANTED) {
-                    val tm = getSystemService(Context.TELEPHONY_SERVICE) as TelephonyManager
-                    val signalStrength = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                        tm.signalStrength?.level ?: -1
-                    } else {
-                        -1 // Not easily available on older versions
-                    }
-                    val networkType = getNetworkTypeString(tm.dataNetworkType)
-                    updateAndPublish("phone:signal", signalStrength.toString())
-                    updateAndPublish("phone:network_type", networkType)
-                }
-
-                if (ContextCompat.checkSelfPermission(this@BoatGatewayService, Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED) {
-                    fusedLocationClient.getCurrentLocation(Priority.PRIORITY_HIGH_ACCURACY, CancellationTokenSource().token)
-                        .addOnSuccessListener { location: Location? ->
-                            if (location != null) {
-                                val gpsString = String.format("%.6f, %.6f", location.latitude, location.longitude)
-                                updateAndPublish("phone:gps", gpsString)
-                                lastGpsFixTime = System.currentTimeMillis()
-                            }
-                        }
-                    if (System.currentTimeMillis() - lastGpsFixTime > 30000) {
-                        updateAndPublish("phone:gps", "Stale Fix")
-                    }
-                }
-
-                updateAndPublish("phone:compass", currentHeading.toString())
-                delay(5000)
+    private fun parseAndSendStmTelemetry(line: String) {
+        when {
+            line.startsWith("V") -> {
+                val value = line.substring(1)
+                updateStatus(boatVoltage = "$value V")
+                sendDataChannelTelemetry("rcboat/telemetry/stm32/voltage", value)
+            }
+            line.startsWith("T") -> {
+                val value = line.substring(1)
+                updateStatus(boatTacho = "$value RPM")
+                sendDataChannelTelemetry("rcboat/telemetry/stm32/tacho", value)
             }
         }
     }
 
-    private fun updateAndPublish(key: String, value: String) {
-        when(key) {
-            "phone:battery" -> updateStatus(phoneBattery = "$value%")
-            "phone:signal" -> updateStatus(phoneSignal = "Level: $value/4")
-            "phone:network_type" -> updateStatus(phoneNetworkType = value)
-            "phone:gps" -> updateStatus(phoneGps = value)
-            "phone:compass" -> updateStatus(phoneHeading = "$value°")
+    private suspend fun periodicTelemetryUpdate() {
+        val fusedLocationClient = LocationServices.getFusedLocationProviderClient(this)
+        while (true) {
+            // Battery
+            val bm = getSystemService(Context.BATTERY_SERVICE) as BatteryManager
+            val batLevel = bm.getIntProperty(BatteryManager.BATTERY_PROPERTY_CAPACITY)
+            updateStatus(phoneBattery = "$batLevel%")
+            sendDataChannelTelemetry("rcboat/telemetry/phone/battery", batLevel.toString())
+
+            // Signal & Network
+            if (ContextCompat.checkSelfPermission(this@BoatGatewayService, Manifest.permission.READ_PHONE_STATE) == PackageManager.PERMISSION_GRANTED) {
+                val tm = getSystemService(Context.TELEPHONY_SERVICE) as TelephonyManager
+                val signalStrength = tm.signalStrength?.level ?: -1
+                val networkType = getNetworkTypeString(tm.dataNetworkType)
+                updateStatus(phoneSignal = "Level: $signalStrength/4", phoneNetworkType = networkType)
+                sendDataChannelTelemetry("rcboat/telemetry/phone/signal", signalStrength.toString())
+                sendDataChannelTelemetry("rcboat/telemetry/phone/network_type", networkType)
+            }
+
+            // GPS with Stale Data Check
+            if (ContextCompat.checkSelfPermission(this@BoatGatewayService, Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED) {
+                fusedLocationClient.getCurrentLocation(Priority.PRIORITY_HIGH_ACCURACY, CancellationTokenSource().token)
+                    .addOnSuccessListener { location: Location? ->
+                        if (location != null) {
+                            val gpsString = String.format("%.6f, %.6f", location.latitude, location.longitude)
+                            updateStatus(phoneGps = gpsString)
+                            sendDataChannelTelemetry("rcboat/telemetry/phone/gps", gpsString)
+                            lastGpsFixTime = System.currentTimeMillis()
+                        }
+                    }
+                if (System.currentTimeMillis() - lastGpsFixTime > 30000) {
+                    updateStatus(phoneGps = "Stale Fix")
+                    sendDataChannelTelemetry("rcboat/telemetry/phone/gps", "Stale Fix")
+                }
+            }
+
+            val headingToPublish = currentPhoneHeading.removeSuffix("°")
+            if(headingToPublish != "---"){
+                sendDataChannelTelemetry("rcboat/telemetry/phone/compass", headingToPublish)
+            }
+
+            delay(250)
         }
-        telemetryDataChannel?.send(DataChannel.Buffer(ByteBuffer.wrap("$key:$value".toByteArray()), false))
     }
 
+    // --- Sensor and Notification Logic ---
     override fun onSensorChanged(event: SensorEvent?) {
         if (event == null) return
         when (event.sensor.type) {
             Sensor.TYPE_ACCELEROMETER -> gravity = event.values.clone()
             Sensor.TYPE_MAGNETIC_FIELD -> geomagnetic = event.values.clone()
         }
+
         if (gravity != null && geomagnetic != null) {
             val r = FloatArray(9)
             val i = FloatArray(9)
-            if (SensorManager.getRotationMatrix(r, i, gravity, geomagnetic)) {
+            val success = SensorManager.getRotationMatrix(r, i, gravity, geomagnetic)
+            if (success) {
                 val orientation = FloatArray(3)
                 SensorManager.getOrientation(r, orientation)
                 val azimuth = Math.toDegrees(orientation[0].toDouble()).toFloat()
-                currentHeading = ((azimuth + 360) % 360).toInt()
+                val heading = (azimuth + 360) % 360
+                currentPhoneHeading = "${heading.toInt()}°"
+                updateStatus(phoneHeading = currentPhoneHeading)
             }
         }
     }
@@ -620,8 +454,12 @@ class BoatGatewayService : Service(), SensorEventListener {
     private fun startSensorListeners() {
         val accelerometer = sensorManager.getDefaultSensor(Sensor.TYPE_ACCELEROMETER)
         val magnetometer = sensorManager.getDefaultSensor(Sensor.TYPE_MAGNETIC_FIELD)
-        sensorManager.registerListener(this, accelerometer, SensorManager.SENSOR_DELAY_UI)
-        sensorManager.registerListener(this, magnetometer, SensorManager.SENSOR_DELAY_UI)
+        accelerometer?.also { accel ->
+            sensorManager.registerListener(this, accel, SensorManager.SENSOR_DELAY_UI)
+        }
+        magnetometer?.also { mag ->
+            sensorManager.registerListener(this, mag, SensorManager.SENSOR_DELAY_UI)
+        }
     }
 
     private fun stopSensorListeners() {
@@ -645,23 +483,241 @@ class BoatGatewayService : Service(), SensorEventListener {
     }
 
     private fun createNotificationChannel() {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            val channel = NotificationChannel(
-                NOTIFICATION_CHANNEL_ID,
-                "Boat Gateway Service Channel",
-                NotificationManager.IMPORTANCE_LOW
-            )
-            getSystemService(NotificationManager::class.java).createNotificationChannel(channel)
+        val channel = NotificationChannel(CHANNEL_ID, "Boat Gateway Service", NotificationManager.IMPORTANCE_LOW)
+        val manager = getSystemService(NotificationManager::class.java)
+        manager.createNotificationChannel(channel)
+    }
+
+    private fun createNotification(contentText: String): Notification {
+        val stopIntent = Intent(this, BoatGatewayService::class.java).apply {
+            action = ACTION_STOP_FROM_NOTIFICATION
+        }
+        val stopPendingIntent = PendingIntent.getService(this, 0, stopIntent, PendingIntent.FLAG_IMMUTABLE)
+
+        return NotificationCompat.Builder(this, CHANNEL_ID)
+            .setContentTitle("RC Boat Gateway")
+            .setContentText(contentText)
+            .setSmallIcon(android.R.drawable.ic_dialog_info)
+            .addAction(0, "Stop", stopPendingIntent)
+            .build()
+    }
+
+    private fun updateNotification(contentText: String) {
+        val notificationManager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+        notificationManager.notify(NOTIFICATION_ID, createNotification(contentText))
+    }
+
+    // --- WebRTC Signaling and Setup ---
+    private fun subscribeToSignaling() {
+        mqttClient?.subscribeWith()
+            ?.topicFilter("rcboat/signaling/base_to_boat")
+            ?.callback { publish ->
+                if (publish.payload.isPresent) {
+                    val message = StandardCharsets.UTF_8.decode(publish.payload.get()).toString()
+                    Log.d(TAG, "Received message: $message")
+                    val json = JSONObject(message)
+                    when {
+                        json.has("type") && json.getString("type") == "bye" -> {
+                            Log.d(TAG, "Received BYE, closing connection")
+                            cleanupWebRTC()
+                        }
+                        json.has("sdp") -> {
+                            val sdp = json.getString("sdp")
+                            val type = SessionDescription.Type.fromCanonicalForm(json.getString("type").lowercase())
+                            if (type == SessionDescription.Type.OFFER) {
+                                if (isWebRTCActive) {
+                                    Log.d(TAG, "Received new offer, restarting WebRTC connection.")
+                                    cleanupWebRTC()
+                                }
+                                Log.d(TAG, "Received OFFER")
+                                handleOffer(SessionDescription(type, sdp))
+                            }
+                        }
+                        json.has("candidate") -> {
+                            Log.d(TAG, "Received ICE Candidate")
+                            val candidate = IceCandidate(
+                                json.getString("sdpMid"),
+                                json.getInt("sdpMLineIndex"),
+                                json.getString("candidate")
+                            )
+                            peerConnection?.addIceCandidate(candidate)
+                        }
+                    }
+                }
+            }
+            ?.send()
+    }
+
+    private fun sendSignalingMessage(message: JSONObject) {
+        Log.d(TAG, "Sending message: $message")
+        if (mqttClient?.state?.isConnected == true) {
+            mqttClient?.publishWith()?.topic("rcboat/signaling/boat_to_base")?.payload(message.toString().toByteArray())?.send()
         }
     }
 
-    private fun createNotification(): Notification {
-        return NotificationCompat.Builder(this, NOTIFICATION_CHANNEL_ID)
-            .setContentTitle("RC Boat Gateway")
-            .setContentText("Controller service is active.")
-            .setSmallIcon(android.R.drawable.ic_dialog_info)
-            .build()
+    private fun cleanupWebRTC() {
+        Log.d(TAG, "Cleaning up WebRTC connection...")
+        try {
+            peerConnection?.close()
+            controlDataChannel?.close()
+            telemetryDataChannel?.close()
+            videoCapturer?.stopCapture()
+            videoCapturer?.dispose()
+        } catch (e: Exception) {
+            Log.e(TAG, "Error during WebRTC cleanup", e)
+        } finally {
+            peerConnection = null
+            videoCapturer = null
+            controlDataChannel = null
+            telemetryDataChannel = null
+            isWebRTCActive = false
+            updateStatus(webRtcStatus = "Idle")
+        }
     }
+
+
+    private fun handleOffer(offerSdp: SessionDescription) {
+        if (isWebRTCActive) {
+            Log.w(TAG, "Ignoring new offer, connection already in progress.")
+            return
+        }
+        isWebRTCActive = true
+        updateStatus(webRtcStatus = "Connecting...")
+
+        if (ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA) != PackageManager.PERMISSION_GRANTED) {
+            Log.e(TAG, "Camera permission not granted, cannot handle offer.")
+            isWebRTCActive = false
+            updateStatus(webRtcStatus = "No Camera Permission")
+            return
+        }
+
+        // Bring the UI to the foreground to ensure camera access is allowed
+        val mainActivityIntent = Intent(this, MainActivity::class.java).apply {
+            flags = Intent.FLAG_ACTIVITY_NEW_TASK
+        }
+
+
+        val iceServers = listOf(
+            PeerConnection.IceServer.builder("stun:stun.l.google.com:19302").createIceServer(),
+            PeerConnection.IceServer.builder("turn:global.turn.twilio.com:3478?transport=udp")
+                .setUsername(BuildConfig.TURN_USERNAME)
+                .setPassword(BuildConfig.TURN_PASSWORD)
+                .createIceServer()
+        )
+        val rtcConfig = PeerConnection.RTCConfiguration(iceServers).apply {
+            sdpSemantics = PeerConnection.SdpSemantics.UNIFIED_PLAN
+        }
+        peerConnection = peerConnectionFactory.createPeerConnection(rtcConfig, object : PeerConnection.Observer {
+            override fun onIceCandidate(candidate: IceCandidate?) {
+                candidate?.let {
+                    Log.d(TAG, "Generated local ICE Candidate")
+                    val json = JSONObject().apply {
+                        put("candidate", it.sdp)
+                        put("sdpMid", it.sdpMid)
+                        put("sdpMLineIndex", it.sdpMLineIndex)
+                    }
+                    sendSignalingMessage(json)
+                }
+            }
+            override fun onDataChannel(dataChannel: DataChannel?) {
+                controlDataChannel = dataChannel
+                controlDataChannel?.registerObserver(object: DataChannel.Observer {
+                    override fun onBufferedAmountChange(p0: Long) {}
+                    override fun onStateChange() {}
+                    override fun onMessage(buffer: DataChannel.Buffer?) {
+                        buffer?.let {
+                            val data = ByteArray(it.data.remaining())
+                            it.data.get(data)
+                            val command = String(data, StandardCharsets.UTF_8)
+                            writeToUsb(command)
+                        }
+                    }
+                })
+            }
+            override fun onConnectionChange(newState: PeerConnection.PeerConnectionState?) {
+                super.onConnectionChange(newState)
+                val status = newState?.name ?: "Unknown"
+                updateStatus(webRtcStatus = status)
+                if (newState == PeerConnection.PeerConnectionState.CONNECTED) {
+                    isWebRTCActive = true
+                }
+                if (newState == PeerConnection.PeerConnectionState.FAILED || newState == PeerConnection.PeerConnectionState.DISCONNECTED || newState == PeerConnection.PeerConnectionState.CLOSED) {
+                    cleanupWebRTC()
+                }
+            }
+            override fun onAddTrack(p0: RtpReceiver?, p1: Array<out MediaStream>?) {}
+            override fun onSignalingChange(p0: PeerConnection.SignalingState?) {}
+            override fun onIceConnectionChange(p0: PeerConnection.IceConnectionState?) {}
+            override fun onIceConnectionReceivingChange(p0: Boolean) {}
+            override fun onIceGatheringChange(p0: PeerConnection.IceGatheringState?) {}
+            override fun onIceCandidatesRemoved(p0: Array<out IceCandidate>?) {}
+            override fun onAddStream(p0: MediaStream?) {}
+            override fun onRemoveStream(p0: MediaStream?) {}
+            override fun onRenegotiationNeeded() {}
+        })
+
+        telemetryDataChannel = peerConnection?.createDataChannel("telemetry", DataChannel.Init())
+        setupCameraTrack()
+
+        peerConnection?.setRemoteDescription(SdpObserverAdapter(), offerSdp)
+        peerConnection?.createAnswer(object: SdpObserverAdapter() {
+            override fun onCreateSuccess(answerSdp: SessionDescription?) {
+                Log.d(TAG, "Created ANSWER")
+                peerConnection?.setLocalDescription(object: SdpObserverAdapter() {
+                    override fun onSetSuccess() {
+                        Log.d(TAG, "Set local description (answer) success")
+                        val json = JSONObject().apply {
+                            put("type", answerSdp?.type?.canonicalForm())
+                            put("sdp", answerSdp?.description)
+                        }
+                        sendSignalingMessage(json)
+                    }
+                    override fun onSetFailure(error: String?) {
+                        Log.e(TAG, "Failed to set local description: $error")
+                        cleanupWebRTC()
+                    }
+                }, answerSdp)
+            }
+            override fun onCreateFailure(error: String?) {
+                Log.e(TAG, "Failed to create answer: $error")
+                cleanupWebRTC()
+            }
+        }, MediaConstraints())
+    }
+
+    private fun setupCameraTrack() {
+        val surfaceTextureHelper = SurfaceTextureHelper.create("VideoCapturerThread", eglBase.eglBaseContext)
+        videoCapturer = createCameraCapturer()
+
+        if (videoCapturer == null) {
+            Log.e(TAG, "Failed to create camera capturer.")
+            return
+        }
+
+        val videoSource = peerConnectionFactory.createVideoSource(videoCapturer!!.isScreencast)
+        videoCapturer!!.initialize(surfaceTextureHelper, this, videoSource.capturerObserver)
+        videoCapturer!!.startCapture(640, 480, 15)
+
+        val videoTrack = peerConnectionFactory.createVideoTrack("videoTrack", videoSource)
+        peerConnection?.addTrack(videoTrack, listOf("stream1"))
+    }
+
+    private fun createCameraCapturer(): CameraVideoCapturer? {
+        val enumerator = Camera2Enumerator(this)
+        val deviceNames = enumerator.deviceNames
+        for (deviceName in deviceNames) {
+            if (enumerator.isBackFacing(deviceName)) {
+                return enumerator.createCapturer(deviceName, null)
+            }
+        }
+        for (deviceName in deviceNames) {
+            if (enumerator.isFrontFacing(deviceName)) {
+                return enumerator.createCapturer(deviceName, null)
+            }
+        }
+        return null
+    }
+
 
     private fun updateStatus(
         usbStatus: String? = null, mqttStatus: String? = null, webRtcStatus: String? = null,
@@ -669,12 +725,18 @@ class BoatGatewayService : Service(), SensorEventListener {
         phoneBattery: String? = null, phoneGps: String? = null, phoneSignal: String? = null,
         phoneNetworkType: String? = null, phoneHeading: String? = null
     ) {
+
+        usbStatus?.let{ currentUsbStatus = it }
+        mqttStatus?.let{ currentMqttStatus = it }
+        webRtcStatus?.let{ currentWebRtcStatus = it }
+        lastCommand?.let{ currentLastCommand = it }
+
         val intent = Intent(ACTION_STATUS_UPDATE).apply {
-            setPackage(packageName) // Important for security
-            usbStatus?.let { putExtra("usbStatus", it) }
-            mqttStatus?.let { putExtra("mqttStatus", it) }
-            webRtcStatus?.let { putExtra("webRtcStatus", it) }
-            lastCommand?.let { putExtra("lastCommand", it) }
+            setPackage(packageName)
+            usbStatus?.let { putExtra("usbStatus", currentUsbStatus) }
+            mqttStatus?.let { putExtra("mqttStatus", currentMqttStatus) }
+            webRtcStatus?.let { putExtra("webRtcStatus", currentWebRtcStatus); updateNotification("WebRTC: $it")}
+            lastCommand?.let { putExtra("lastCommand", currentLastCommand) }
             boatVoltage?.let { putExtra("boatVoltage", it) }
             boatTacho?.let { putExtra("boatTacho", it) }
             phoneBattery?.let { putExtra("phoneBattery", it) }
@@ -687,91 +749,130 @@ class BoatGatewayService : Service(), SensorEventListener {
     }
 
     companion object {
+        const val TAG = "BoatGatewayService"
+        const val CHANNEL_ID = "BoatGatewayServiceChannel"
+        const val ACTION_STOP_FROM_NOTIFICATION = "com.example.rc_boat_controller_cellular.STOP_FROM_NOTIFICATION"
         const val ACTION_STATUS_UPDATE = "com.example.rc_boat_controller_cellular.STATUS_UPDATE"
         private const val NOTIFICATION_ID = 1
-        private const val NOTIFICATION_CHANNEL_ID = "BoatGatewayServiceChannel"
     }
 }
 
 
 // --- UI Composables ---
 @Composable
-fun BoatStatusScreen(viewModel: BoatViewModel = viewModel()) {
+fun BoatControllerScreen(viewModel: BoatViewModel = viewModel()) {
     val uiState by viewModel.uiState.collectAsState()
+    val context = LocalContext.current
 
-    Column(modifier = Modifier.padding(16.dp)) {
-        Text("Boat Gateway", style = MaterialTheme.typography.headlineLarge)
-        Text("Service is running in the background.", style = MaterialTheme.typography.bodyLarge)
-        Spacer(modifier = Modifier.height(16.dp))
-        TelemetryDisplay(uiState)
+    DisposableEffect(Unit) {
+        val usbPermissionReceiver = object : BroadcastReceiver() {
+            override fun onReceive(context: Context?, intent: Intent?) {
+                if (intent?.action == ACTION_USB_PERMISSION) {
+                    // This just ensures the broadcast is registered, the service handles connection
+                }
+            }
+        }
+        context.registerReceiver(usbPermissionReceiver, IntentFilter(ACTION_USB_PERMISSION), Context.RECEIVER_NOT_EXPORTED)
+        onDispose {
+            context.unregisterReceiver(usbPermissionReceiver)
+        }
+    }
+
+    Column(
+        modifier = Modifier.fillMaxSize().padding(16.dp),
+        horizontalAlignment = Alignment.CenterHorizontally,
+        verticalArrangement = Arrangement.Center
+    ) {
+        Text("RC Boat Gateway", style = MaterialTheme.typography.headlineLarge)
+        Spacer(Modifier.height(24.dp))
+
+        Button(onClick = {
+            val usbManager = context.getSystemService(Context.USB_SERVICE) as UsbManager
+            val availableDrivers = UsbSerialProber.getDefaultProber().findAllDrivers(usbManager)
+            if (availableDrivers.isNotEmpty()) {
+                val permissionIntent = PendingIntent.getBroadcast(context, 0, Intent(ACTION_USB_PERMISSION), PendingIntent.FLAG_IMMUTABLE)
+                usbManager.requestPermission(availableDrivers[0].device, permissionIntent)
+            }
+        }) {
+            Text("Request USB Permission")
+        }
+
+        Spacer(Modifier.height(24.dp))
+
+        ConnectionStatus(
+            usbStatus = uiState.usbStatus,
+            mqttStatus = uiState.mqttStatus,
+            webRtcStatus = uiState.webRtcStatus
+        )
+        Spacer(Modifier.height(16.dp))
+        TelemetryDisplay(uiState = uiState)
     }
 }
 
-
 @Composable
-fun TelemetryDisplay(state: UiState) {
-    Card {
+fun ConnectionStatus(usbStatus: String, mqttStatus: String, webRtcStatus: String) {
+    Card(modifier = Modifier.fillMaxWidth()) {
         Column(modifier = Modifier.padding(12.dp)) {
-            Text("Live Status", style = MaterialTheme.typography.titleMedium, modifier = Modifier.padding(bottom = 8.dp))
-            ConnectionStatus("USB Status", state.usbStatus)
-            ConnectionStatus("MQTT Status", state.mqttStatus)
-            ConnectionStatus("WebRTC Status", state.webRtcStatus)
-            Divider(modifier = Modifier.padding(vertical = 4.dp))
-            TelemetryRow("Last Command", state.lastCommand)
-            Divider(modifier = Modifier.padding(vertical = 4.dp))
-            TelemetryRow("Boat Voltage", state.boatVoltage)
-            TelemetryRow("Boat Tacho", state.boatTacho)
-            Divider(modifier = Modifier.padding(vertical = 4.dp))
-            TelemetryRow("Phone Battery", state.phoneBattery)
-            TelemetryRow("Phone Signal", state.phoneSignal)
-            TelemetryRow("Phone Network", state.phoneNetworkType)
-            TelemetryRow("Phone Heading", state.phoneHeading)
-            TelemetryRow("Phone GPS", state.phoneGps)
+            Text("Live Status", style = MaterialTheme.typography.titleMedium)
+            Spacer(Modifier.height(8.dp))
+            StatusRow("USB", usbStatus)
+            StatusRow("MQTT", mqttStatus)
+            StatusRow("WebRTC", webRtcStatus)
         }
     }
 }
 
 @Composable
-fun ConnectionStatus(label: String, status: String) {
-    val color = when (status.uppercase()) {
-        "CONNECTED" -> Color(0xFF4CAF50) // Green
-        "CONNECTING", "HANDSHAKE...", "CHECKING" -> Color(0xFFFFC107) // Amber
-        else -> if (status.startsWith("Failed")) Color.Red else MaterialTheme.colorScheme.onSurface
+fun TelemetryDisplay(uiState: UiState) {
+    Card(modifier = Modifier.fillMaxWidth()) {
+        Column(modifier = Modifier.padding(12.dp)) {
+            Text("Telemetry", style = MaterialTheme.typography.titleMedium, modifier = Modifier.padding(bottom = 8.dp))
+            TelemetryRow("Last Command", uiState.lastCommand)
+            Divider(modifier = Modifier.padding(vertical = 4.dp))
+            TelemetryRow("Boat Voltage", uiState.boatVoltage)
+            TelemetryRow("Boat Tacho", uiState.boatTacho)
+            Divider(modifier = Modifier.padding(vertical = 4.dp))
+            TelemetryRow("Phone Battery", uiState.phoneBattery)
+            TelemetryRow("Phone Signal", uiState.phoneSignal)
+            TelemetryRow("Phone Network", uiState.phoneNetworkType)
+            TelemetryRow("Phone Heading", uiState.phoneHeading)
+            TelemetryRow("Phone GPS", uiState.phoneGps)
+        }
     }
-    Row(
-        modifier = Modifier
-            .fillMaxWidth()
-            .padding(vertical = 2.dp),
-        horizontalArrangement = Arrangement.SpaceBetween
-    ) {
+}
+
+@Composable
+fun StatusRow(label: String, status: String) {
+    val statusColor = when (status.lowercase()) {
+        "connected", "open" -> Color(0xFF00C853) // Green
+        "connecting...", "opening..." -> Color.Yellow
+        else -> Color.Gray
+    }
+    Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
         Text(label, fontWeight = FontWeight.Bold)
-        Text(status, color = color, fontWeight = FontWeight.Bold)
+        Text(status, color = statusColor)
     }
 }
 
 @Composable
 fun TelemetryRow(label: String, value: String) {
-    Row(
-        modifier = Modifier
-            .fillMaxWidth()
-            .padding(vertical = 4.dp),
-        horizontalArrangement = Arrangement.SpaceBetween
-    ) {
+    Row(modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp), horizontalArrangement = Arrangement.SpaceBetween) {
         Text(label, fontWeight = FontWeight.Bold)
-        Text(value, fontSize = 14.sp)
+        Text(value)
     }
 }
 
+// --- Theme and Constants ---
+private const val ACTION_USB_PERMISSION = "com.example.rc_boat_controller_cellular.USB_PERMISSION"
+
 @Composable
 fun RCBoatControllerTheme(content: @Composable () -> Unit) {
-    MaterialTheme(
-        colorScheme = darkColorScheme(
-            primary = Color(0xFF3F51B5),
-            secondary = Color(0xFF03A9F4),
-            tertiary = Color(0xFF009688)
-        ),
-        content = content
+    val colorScheme = darkColorScheme(
+        primary = Color(0xFFBB86FC),
+        secondary = Color(0xFF03DAC6),
+        tertiary = Color(0xFF3700B3)
     )
+    MaterialTheme(colorScheme = colorScheme, content = content)
 }
 
 // SdpObserver adapter to simplify callbacks
@@ -781,4 +882,3 @@ open class SdpObserverAdapter : SdpObserver {
     override fun onCreateFailure(p0: String?) {}
     override fun onSetFailure(p0: String?) {}
 }
-
