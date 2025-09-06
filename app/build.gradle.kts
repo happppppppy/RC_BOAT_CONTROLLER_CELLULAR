@@ -72,7 +72,6 @@ dependencies {
     implementation(libs.androidx.camera.lifecycle)
     implementation(libs.androidx.camera.view)
     implementation("org.webrtc:google-webrtc:1.0.30039@aar")
-
     implementation(libs.hivemq.mqtt.client)
     implementation(libs.usb.serial.for1.android)
     implementation(libs.androidx.lifecycle.viewmodel.compose)

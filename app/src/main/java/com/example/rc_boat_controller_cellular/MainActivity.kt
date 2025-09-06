@@ -13,6 +13,7 @@ import android.hardware.SensorEventListener
 import android.hardware.SensorManager
 import android.hardware.usb.UsbManager
 import android.location.Location
+import android.media.session.MediaSession.Token
 import android.os.*
 import android.telephony.TelephonyManager
 import android.util.Log
@@ -28,7 +29,6 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
-import androidx.compose.ui.unit.sp
 import androidx.core.app.NotificationCompat
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.AndroidViewModel
@@ -53,6 +53,7 @@ import org.webrtc.*
 import java.nio.ByteBuffer
 import java.nio.charset.StandardCharsets
 import java.util.UUID
+
 
 // --- Main Activity: UI and Service Control ---
 class MainActivity : ComponentActivity() {
@@ -177,6 +178,9 @@ class BoatGatewayService : Service(), SensorEventListener {
     private var telemetryDataChannel: DataChannel? = null
     private var isWebRTCActive = false
 
+    private val webRtcCleanupLock = Any()
+    private var isCleanupInProgressOrDone = false
+
 
     inner class LocalBinder : Binder() {
         fun getService(): BoatGatewayService = this@BoatGatewayService
@@ -224,8 +228,8 @@ class BoatGatewayService : Service(), SensorEventListener {
         disconnectUsb()
         disconnectMqtt()
         stopSensorListeners()
-        cleanupWebRTC()
-        stopForeground(true)
+        initiateWebRTCCleanup()
+//        stopForeground(true)
         stopSelf()
         Log.d(TAG, "Gateway Service Stopped")
     }
@@ -241,10 +245,10 @@ class BoatGatewayService : Service(), SensorEventListener {
                     if (usbManager.hasPermission(driver.device)) {
                         connectUsb(usbManager, driver)
                     } else {
-                        updateStatus(usbStatus = "Permission Needed")
+                        updateAndBroadcastStatus(usbStatus = "Permission Needed")
                     }
                 } else {
-                    updateStatus(usbStatus = "Disconnected")
+                    updateAndBroadcastStatus(usbStatus = "Disconnected")
                 }
             }
             delay(5000) // Check every 5 seconds
@@ -254,7 +258,7 @@ class BoatGatewayService : Service(), SensorEventListener {
     private fun connectUsb(usbManager: UsbManager, driver: UsbSerialDriver) {
         val connection = usbManager.openDevice(driver.device)
         if (connection == null) {
-            updateStatus(usbStatus = "Failed to open device")
+            updateAndBroadcastStatus(usbStatus = "Failed to open device")
             return
         }
 
@@ -262,10 +266,10 @@ class BoatGatewayService : Service(), SensorEventListener {
         try {
             usbSerialPort?.open(connection)
             usbSerialPort?.setParameters(115200, 8, UsbSerialPort.STOPBITS_1, UsbSerialPort.PARITY_NONE)
-            updateStatus(usbStatus = "Connected")
+            updateAndBroadcastStatus(usbStatus = "Connected")
             startReadingUsbData()
         } catch (e: Exception) {
-            updateStatus(usbStatus = "Error: ${e.message}")
+            updateAndBroadcastStatus(usbStatus = "Error: ${e.message}")
             disconnectUsb()
         }
     }
@@ -287,7 +291,7 @@ class BoatGatewayService : Service(), SensorEventListener {
                         }
                     }
                 } catch (e: Exception) {
-                    updateStatus(usbStatus = "Disconnected")
+                    updateAndBroadcastStatus(usbStatus = "Disconnected")
                     break
                 }
             }
@@ -299,9 +303,9 @@ class BoatGatewayService : Service(), SensorEventListener {
             CoroutineScope(Dispatchers.IO).launch {
                 try {
                     usbSerialPort?.write(data.toByteArray(), 500)
-                    updateStatus(lastCommand = data.trim())
+                    updateAndBroadcastStatus(lastCommand = data.trim())
                 } catch (e: Exception) {
-                    updateStatus(usbStatus = "Write Error")
+                    updateAndBroadcastStatus(usbStatus = "Write Error")
                 }
             }
         }
@@ -317,7 +321,7 @@ class BoatGatewayService : Service(), SensorEventListener {
 
     private fun connectMqtt() {
         if (mqttClient?.state?.isConnectedOrReconnect == true) return
-        updateStatus(mqttStatus = "Connecting...")
+        updateAndBroadcastStatus(mqttStatus = "Connecting...")
 
         mqttClient = MqttClient.builder()
             .useMqttVersion5()
@@ -328,13 +332,13 @@ class BoatGatewayService : Service(), SensorEventListener {
             .automaticReconnectWithDefaultConfig()
             .addConnectedListener {
                 Log.d(TAG, "MQTT reconnected, sending hello.")
-                updateStatus(mqttStatus = "Connected")
+                updateAndBroadcastStatus(mqttStatus = "Connected")
                 subscribeToSignaling()
                 sendSignalingMessage(JSONObject().put("type", "hello"))
             }
             .addDisconnectedListener {
                 Log.d(TAG, "MQTT disconnected.")
-                cleanupWebRTC()
+                initiateWebRTCCleanup()
             }
             .buildAsync()
 
@@ -347,10 +351,10 @@ class BoatGatewayService : Service(), SensorEventListener {
             ?.whenComplete { _, throwable: Throwable? ->
                 if (throwable != null) {
                     Log.w(TAG, "MQTT failed.")
-                    updateStatus(mqttStatus = "Failed: ${throwable.message}")
+                    updateAndBroadcastStatus(mqttStatus = "Failed: ${throwable.message}")
                 } else {
                     Log.d(TAG, "MQTT connected.")
-                    updateStatus(mqttStatus = "Connected")
+                    updateAndBroadcastStatus(mqttStatus = "Connected")
                 }
             }
     }
@@ -371,12 +375,12 @@ class BoatGatewayService : Service(), SensorEventListener {
         when {
             line.startsWith("V") -> {
                 val value = line.substring(1)
-                updateStatus(boatVoltage = "$value V")
+                updateAndBroadcastStatus(boatVoltage = "$value V")
                 sendDataChannelTelemetry("rcboat/telemetry/stm32/voltage", value)
             }
             line.startsWith("T") -> {
                 val value = line.substring(1)
-                updateStatus(boatTacho = "$value RPM")
+                updateAndBroadcastStatus(boatTacho = "$value RPM")
                 sendDataChannelTelemetry("rcboat/telemetry/stm32/tacho", value)
             }
         }
@@ -388,7 +392,7 @@ class BoatGatewayService : Service(), SensorEventListener {
             // Battery
             val bm = getSystemService(Context.BATTERY_SERVICE) as BatteryManager
             val batLevel = bm.getIntProperty(BatteryManager.BATTERY_PROPERTY_CAPACITY)
-            updateStatus(phoneBattery = "$batLevel%")
+            updateAndBroadcastStatus(phoneBattery = "$batLevel%")
             sendDataChannelTelemetry("rcboat/telemetry/phone/battery", batLevel.toString())
 
             // Signal & Network
@@ -396,7 +400,7 @@ class BoatGatewayService : Service(), SensorEventListener {
                 val tm = getSystemService(Context.TELEPHONY_SERVICE) as TelephonyManager
                 val signalStrength = tm.signalStrength?.level ?: -1
                 val networkType = getNetworkTypeString(tm.dataNetworkType)
-                updateStatus(phoneSignal = "Level: $signalStrength/4", phoneNetworkType = networkType)
+                updateAndBroadcastStatus(phoneSignal = "Level: $signalStrength/4", phoneNetworkType = networkType)
                 sendDataChannelTelemetry("rcboat/telemetry/phone/signal", signalStrength.toString())
                 sendDataChannelTelemetry("rcboat/telemetry/phone/network_type", networkType)
             }
@@ -407,13 +411,13 @@ class BoatGatewayService : Service(), SensorEventListener {
                     .addOnSuccessListener { location: Location? ->
                         if (location != null) {
                             val gpsString = String.format("%.6f, %.6f", location.latitude, location.longitude)
-                            updateStatus(phoneGps = gpsString)
+                            updateAndBroadcastStatus(phoneGps = gpsString)
                             sendDataChannelTelemetry("rcboat/telemetry/phone/gps", gpsString)
                             lastGpsFixTime = System.currentTimeMillis()
                         }
                     }
                 if (System.currentTimeMillis() - lastGpsFixTime > 30000) {
-                    updateStatus(phoneGps = "Stale Fix")
+                    updateAndBroadcastStatus(phoneGps = "Stale Fix")
                     sendDataChannelTelemetry("rcboat/telemetry/phone/gps", "Stale Fix")
                 }
             }
@@ -445,7 +449,7 @@ class BoatGatewayService : Service(), SensorEventListener {
                 val azimuth = Math.toDegrees(orientation[0].toDouble()).toFloat()
                 val heading = (azimuth + 360) % 360
                 currentPhoneHeading = "${heading.toInt()}°"
-                updateStatus(phoneHeading = currentPhoneHeading)
+                updateAndBroadcastStatus(phoneHeading = currentPhoneHeading)
             }
         }
     }
@@ -507,6 +511,66 @@ class BoatGatewayService : Service(), SensorEventListener {
         notificationManager.notify(NOTIFICATION_ID, createNotification(contentText))
     }
 
+
+
+    private fun handleByeMessage() {
+        Log.d(TAG, "Received BYE, closing connection")
+        initiateWebRTCCleanup()
+    }
+
+    // Called from PeerConnection.Observer onConnectionChange
+    private fun onWebRTCConnectionFailedOrClosed() {
+        Log.d(TAG, "WebRTC connection failed or closed, initiating cleanup.")
+        initiateWebRTCCleanup()
+    }
+
+    private fun initiateWebRTCCleanup() {
+        synchronized(webRtcCleanupLock) {
+            if (isCleanupInProgressOrDone) {
+                Log.d(TAG, "Cleanup already in progress or completed. Ignoring additional request.")
+                return
+            }
+            isCleanupInProgressOrDone = true
+            Log.d(TAG, "Starting WebRTC cleanup...")
+        }
+
+        performActualWebRTCCleanup()
+    }
+
+    private fun performActualWebRTCCleanup() {
+        Log.d(TAG, "Performing actual WebRTC resource release...")
+        try {
+            controlDataChannel?.unregisterObserver()
+            telemetryDataChannel?.unregisterObserver()
+
+            Log.d(TAG, "Closing control data channel...")
+            controlDataChannel?.close()
+            Log.d(TAG, "Closing telemetry data channel...")
+            telemetryDataChannel?.close()
+
+            Log.d(TAG, "Stopping video capture...")
+            videoCapturer?.stopCapture()
+            Log.d(TAG, "Disposing video capture...")
+            videoCapturer?.dispose()
+
+            Log.d(TAG, "Closing peer connection...")
+            peerConnection?.close()
+
+        } catch (e: Exception) {
+            Log.e(TAG, "Error during WebRTC cleanup", e)
+        } finally {
+            peerConnection = null
+            videoCapturer = null
+            controlDataChannel = null
+            telemetryDataChannel = null
+            isWebRTCActive = false
+            updateAndBroadcastStatus(webRtcStatus = "Idle")
+            isCleanupInProgressOrDone = false
+            Log.i("BoatGatewayService", "WebRTC cleanup complete")
+
+        }
+    }
+
     // --- WebRTC Signaling and Setup ---
     private fun subscribeToSignaling() {
         mqttClient?.subscribeWith()
@@ -518,18 +582,12 @@ class BoatGatewayService : Service(), SensorEventListener {
                     val json = JSONObject(message)
                     when {
                         json.has("type") && json.getString("type") == "bye" -> {
-                            Log.d(TAG, "Received BYE, closing connection")
-                            cleanupWebRTC()
+                            handleByeMessage()
                         }
                         json.has("sdp") -> {
                             val sdp = json.getString("sdp")
                             val type = SessionDescription.Type.fromCanonicalForm(json.getString("type").lowercase())
                             if (type == SessionDescription.Type.OFFER) {
-                                if (isWebRTCActive) {
-                                    Log.d(TAG, "Received new offer, restarting WebRTC connection.")
-                                    cleanupWebRTC()
-                                }
-                                Log.d(TAG, "Received OFFER")
                                 handleOffer(SessionDescription(type, sdp))
                             }
                         }
@@ -555,39 +613,21 @@ class BoatGatewayService : Service(), SensorEventListener {
         }
     }
 
-    private fun cleanupWebRTC() {
-        Log.d(TAG, "Cleaning up WebRTC connection...")
-        try {
-            peerConnection?.close()
-            controlDataChannel?.close()
-            telemetryDataChannel?.close()
-            videoCapturer?.stopCapture()
-            videoCapturer?.dispose()
-        } catch (e: Exception) {
-            Log.e(TAG, "Error during WebRTC cleanup", e)
-        } finally {
-            peerConnection = null
-            videoCapturer = null
-            controlDataChannel = null
-            telemetryDataChannel = null
-            isWebRTCActive = false
-            updateStatus(webRtcStatus = "Idle")
-        }
-    }
+
 
 
     private fun handleOffer(offerSdp: SessionDescription) {
         if (isWebRTCActive) {
-            Log.w(TAG, "Ignoring new offer, connection already in progress.")
-            return
+            Log.w(TAG, "Received new offer, closing existing WebRTC connection.")
+            initiateWebRTCCleanup()
         }
         isWebRTCActive = true
-        updateStatus(webRtcStatus = "Connecting...")
+        updateAndBroadcastStatus(webRtcStatus = "Connecting...")
 
         if (ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA) != PackageManager.PERMISSION_GRANTED) {
             Log.e(TAG, "Camera permission not granted, cannot handle offer.")
             isWebRTCActive = false
-            updateStatus(webRtcStatus = "No Camera Permission")
+            updateAndBroadcastStatus(webRtcStatus = "No Camera Permission")
             return
         }
 
@@ -596,13 +636,26 @@ class BoatGatewayService : Service(), SensorEventListener {
             flags = Intent.FLAG_ACTIVITY_NEW_TASK
         }
 
-
         val iceServers = listOf(
             PeerConnection.IceServer.builder("stun:stun.l.google.com:19302").createIceServer(),
+            PeerConnection.IceServer.builder("turn:numb.viagenie.ca:3478")
+                .setUsername("webrtc@live.com")
+                .setPassword("muazkh")
+                .createIceServer(),
+            PeerConnection.IceServer.builder("stun:global.stun.twilio.com:3478").createIceServer(),
             PeerConnection.IceServer.builder("turn:global.turn.twilio.com:3478?transport=udp")
-                .setUsername(BuildConfig.TURN_USERNAME)
-                .setPassword(BuildConfig.TURN_PASSWORD)
-                .createIceServer()
+                .setUsername("250b9e51bb86c20f5f99984953172df13ac1d09809730aef69bbc5c08266e2fa")
+                .setPassword("6oKhPT5Htb50TnmGz/zRhjSZ14jakfjwiE/MRRIUtks=")
+                .createIceServer(),
+            PeerConnection.IceServer.builder("turn:global.turn.twilio.com:3478?transport=tcp")
+                .setUsername("250b9e51bb86c20f5f99984953172df13ac1d09809730aef69bbc5c08266e2fa")
+                .setPassword("6oKhPT5Htb50TnmGz/zRhjSZ14jakfjwiE/MRRIUtks=")
+                .createIceServer(),
+            PeerConnection.IceServer.builder("turn:global.turn.twilio.com:443?transport=tcp")
+                .setUsername("250b9e51bb86c20f5f99984953172df13ac1d09809730aef69bbc5c08266e2fa")
+                .setPassword("6oKhPT5Htb50TnmGz/zRhjSZ14jakfjwiE/MRRIUtks=")
+                .createIceServer(),
+
         )
         val rtcConfig = PeerConnection.RTCConfiguration(iceServers).apply {
             sdpSemantics = PeerConnection.SdpSemantics.UNIFIED_PLAN
@@ -637,12 +690,12 @@ class BoatGatewayService : Service(), SensorEventListener {
             override fun onConnectionChange(newState: PeerConnection.PeerConnectionState?) {
                 super.onConnectionChange(newState)
                 val status = newState?.name ?: "Unknown"
-                updateStatus(webRtcStatus = status)
+                updateAndBroadcastStatus(webRtcStatus = status)
                 if (newState == PeerConnection.PeerConnectionState.CONNECTED) {
                     isWebRTCActive = true
                 }
                 if (newState == PeerConnection.PeerConnectionState.FAILED || newState == PeerConnection.PeerConnectionState.DISCONNECTED || newState == PeerConnection.PeerConnectionState.CLOSED) {
-                    cleanupWebRTC()
+                    onWebRTCConnectionFailedOrClosed()
                 }
             }
             override fun onAddTrack(p0: RtpReceiver?, p1: Array<out MediaStream>?) {}
@@ -674,13 +727,13 @@ class BoatGatewayService : Service(), SensorEventListener {
                     }
                     override fun onSetFailure(error: String?) {
                         Log.e(TAG, "Failed to set local description: $error")
-                        cleanupWebRTC()
+                        onWebRTCConnectionFailedOrClosed()
                     }
                 }, answerSdp)
             }
             override fun onCreateFailure(error: String?) {
                 Log.e(TAG, "Failed to create answer: $error")
-                cleanupWebRTC()
+                onWebRTCConnectionFailedOrClosed()
             }
         }, MediaConstraints())
     }
@@ -719,11 +772,18 @@ class BoatGatewayService : Service(), SensorEventListener {
     }
 
 
-    private fun updateStatus(
-        usbStatus: String? = null, mqttStatus: String? = null, webRtcStatus: String? = null,
-        lastCommand: String? = null, boatVoltage: String? = null, boatTacho: String? = null,
-        phoneBattery: String? = null, phoneGps: String? = null, phoneSignal: String? = null,
-        phoneNetworkType: String? = null, phoneHeading: String? = null
+    private fun updateAndBroadcastStatus(
+        usbStatus: String? = null,
+        mqttStatus: String? = null,
+        webRtcStatus: String? = null,
+        lastCommand: String? = null,
+        boatVoltage: String? = null,
+        boatTacho: String? = null,
+        phoneBattery: String? = null,
+        phoneGps: String? = null,
+        phoneSignal: String? = null,
+        phoneNetworkType: String? = null,
+        phoneHeading: String? = null
     ) {
 
         usbStatus?.let{ currentUsbStatus = it }
@@ -746,6 +806,9 @@ class BoatGatewayService : Service(), SensorEventListener {
             phoneHeading?.let { putExtra("phoneHeading", it) }
         }
         sendBroadcast(intent)
+        // Update notification with relevant combined status
+//        val notificationText = "MQTT: $currentMqttStatus, WebRTC: $currentWebRtcStatus, USB: $currentUsbStatus"
+//        startForeground(NOTIFICATION_ID, createNotification(notificationText))
     }
 
     companion object {
@@ -779,7 +842,9 @@ fun BoatControllerScreen(viewModel: BoatViewModel = viewModel()) {
     }
 
     Column(
-        modifier = Modifier.fillMaxSize().padding(16.dp),
+        modifier = Modifier
+            .fillMaxSize()
+            .padding(16.dp),
         horizontalAlignment = Alignment.CenterHorizontally,
         verticalArrangement = Arrangement.Center
     ) {
@@ -856,7 +921,9 @@ fun StatusRow(label: String, status: String) {
 
 @Composable
 fun TelemetryRow(label: String, value: String) {
-    Row(modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp), horizontalArrangement = Arrangement.SpaceBetween) {
+    Row(modifier = Modifier
+        .fillMaxWidth()
+        .padding(vertical = 4.dp), horizontalArrangement = Arrangement.SpaceBetween) {
         Text(label, fontWeight = FontWeight.Bold)
         Text(value)
     }
