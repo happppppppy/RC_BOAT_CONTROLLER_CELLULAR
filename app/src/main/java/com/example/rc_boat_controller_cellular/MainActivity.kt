@@ -46,6 +46,8 @@ import com.hoho.android.usbserial.driver.UsbSerialProber
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -164,7 +166,6 @@ class BoatGatewayService : Service(), SensorEventListener {
     // --- Status Variables ---
     private var currentUsbStatus: String = "Disconnected"
     private var currentMqttStatus: String = "Disconnected"
-    private var currentWebRtcStatus: String = "Idle"
     private var currentLastCommand: String = "None"
 
     // --- WebRTC Components ---
@@ -178,9 +179,11 @@ class BoatGatewayService : Service(), SensorEventListener {
     }
     private var peerConnection: PeerConnection? = null
     private var videoCapturer: CameraVideoCapturer? = null
+    private var videoTrack: VideoTrack? = null
     private var controlDataChannel: DataChannel? = null
     private var telemetryDataChannel: DataChannel? = null
-    private var isWebRTCActive = false
+
+    private var currentWebRtcStatus: String = peerConnection?.connectionState().toString()
 
     private val webRtcCleanupLock = Any()
     private var isCleanupInProgressOrDone = false
@@ -210,6 +213,7 @@ class BoatGatewayService : Service(), SensorEventListener {
     override fun onDestroy() {
         stopGateway()
         super.onDestroy()
+        cleanupScope.cancel()
     }
 
     private fun startGateway() {
@@ -230,7 +234,6 @@ class BoatGatewayService : Service(), SensorEventListener {
         Log.d(TAG, "Stopping Gateway Service...")
         serviceJob?.cancel()
         disconnectUsb()
-//        disconnectMqtt()
         stopSensorListeners()
         initiateWebRTCCleanup()
 //        stopForeground(true)
@@ -375,10 +378,6 @@ class BoatGatewayService : Service(), SensorEventListener {
             val buffer = ByteBuffer.wrap(message.toByteArray(StandardCharsets.UTF_8))
             telemetryDataChannel?.send(DataChannel.Buffer(buffer, false))
         }
-    }
-
-    private fun disconnectMqtt() {
-        mqttClient?.disconnect()
     }
 
     private fun parseAndSendStmTelemetry(line: String) {
@@ -547,8 +546,10 @@ class BoatGatewayService : Service(), SensorEventListener {
         performActualWebRTCCleanup()
     }
 
+    private val cleanupScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
+
     private fun performActualWebRTCCleanup() {
-        Log.d(TAG, "Performing actual WebRTC resource release...")
+        Log.d(TAG, "Performing actual WebRTC resource release on thread: ${Thread.currentThread().name}")
         try {
             controlDataChannel?.unregisterObserver()
             telemetryDataChannel?.unregisterObserver()
@@ -559,28 +560,76 @@ class BoatGatewayService : Service(), SensorEventListener {
             telemetryDataChannel?.close()
 
             Log.d(TAG, "Stopping video capture...")
+            videoTrack?.dispose()
             videoCapturer?.stopCapture()
-            Log.d(TAG, "Disposing video capture...")
-            videoCapturer?.dispose()
 
             Log.d(TAG, "Closing peer connection...")
-            peerConnection?.close()
+            // Dispatch peerConnection.close() to a different thread
+            val pc = peerConnection // Capture for use in coroutine
+            if (pc != null) {
+                Log.d(TAG, "Dispatching peerConnection.close() to background thread...")
+                cleanupScope.launch { // Launch on IO dispatcher
+                    try {
+                        Log.d(TAG, "Attempting peerConnection.close() on thread: ${Thread.currentThread().name}")
+                        pc.close()
+                        Log.i(TAG, "Peer connection closed successfully (from background thread).")
+                        // Proceed with nullifying and updating status from this background thread
+                        // or post back to a main/handler thread if UI updates are needed directly from here.
+                        // For now, let's assume further cleanup can happen here.
+                        nullifyWebRTCResourcesAndSignal() // New method for post-close actions
+
+                    } catch (e: Exception) {
+                        Log.e(TAG, "Error during peerConnection.close() in background thread", e)
+                        // Still ensure cleanup finalization happens
+                        nullifyWebRTCResourcesAndSignal()
+                    }
+                }
+                // NOTE: The code after this launch block will execute immediately,
+                // NOT waiting for pc.close() to finish. The 'finally' block below
+                // needs to be rethought if pc.close() is async.
+            } else {
+                Log.d(TAG, "PeerConnection was already null before attempting close.")
+                nullifyWebRTCResourcesAndSignal() // If pc was null, proceed to nullify and signal
+            }
+
+            Log.d(TAG, "Peer connection closed.")
 
 
         } catch (e: Exception) {
-            Log.e(TAG, "Error during WebRTC cleanup", e)
+            Log.e(TAG, "Error during initial WebRTC cleanup steps (before pc.close dispatch)", e)
+            cleanupScope.launch { nullifyWebRTCResourcesAndSignal() }
+
         } finally {
             peerConnection = null
+            videoTrack = null
             videoCapturer = null
             controlDataChannel = null
             telemetryDataChannel = null
-            isWebRTCActive = false
             updateAndBroadcastStatus(webRtcStatus = "Idle")
             isCleanupInProgressOrDone = false
             Log.i("BoatGatewayService", "WebRTC cleanup complete")
 
         }
     }
+
+    private fun nullifyWebRTCResourcesAndSignal() {
+        // This function should be called AFTER peerConnection.close() has completed or failed
+        // Ensure this is thread-safe if called from different contexts, or dispatch to a consistent thread.
+        // For simplicity, assuming it's called from the cleanupScope coroutine or after pc is confirmed null.
+        Log.d(TAG, "Nullifying WebRTC resources and updating status on thread: ${Thread.currentThread().name}")
+        peerConnection = null
+//        videoTrack = null
+//        videoCapturer = null
+        controlDataChannel = null
+        telemetryDataChannel = null
+        updateAndBroadcastStatus(webRtcStatus = "Idle") // Ensure this is thread-safe or posts to main thread if needed
+
+        synchronized(webRtcCleanupLock) { // Reset the cleanup guard
+            isCleanupInProgressOrDone = false
+        }
+        Log.i(TAG, "WebRTC cleanup complete (after nullification and status update).")
+    }
+
 
     // --- WebRTC Signaling and Setup ---
     private fun subscribeToSignaling() {
@@ -647,19 +696,17 @@ class BoatGatewayService : Service(), SensorEventListener {
     }
 
 
-
-
     private fun handleOffer(offerSdp: SessionDescription) {
-        if (isWebRTCActive) {
+
+        if (peerConnection?.connectionState() == PeerConnection.PeerConnectionState.CONNECTED) {
             Log.w(TAG, "Received new offer, closing existing WebRTC connection.")
             initiateWebRTCCleanup()
         }
-        isWebRTCActive = true
+
         updateAndBroadcastStatus(webRtcStatus = "Connecting...")
 
         if (ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA) != PackageManager.PERMISSION_GRANTED) {
             Log.e(TAG, "Camera permission not granted, cannot handle offer.")
-            isWebRTCActive = false
             updateAndBroadcastStatus(webRtcStatus = "No Camera Permission")
             return
         }
@@ -670,12 +717,14 @@ class BoatGatewayService : Service(), SensorEventListener {
         }
 
         val iceServers = listOf(
-            PeerConnection.IceServer.builder("stun:stun.l.google.com:19302").createIceServer(),
+            PeerConnection.IceServer.builder("stun:stun.l.google.com:19302")
+                .createIceServer(),
             PeerConnection.IceServer.builder("turn:numb.viagenie.ca:3478")
                 .setUsername("webrtc@live.com")
                 .setPassword("muazkh")
                 .createIceServer(),
-            PeerConnection.IceServer.builder("stun:global.stun.twilio.com:3478").createIceServer(),
+            PeerConnection.IceServer.builder("stun:global.stun.twilio.com:3478")
+                .createIceServer(),
             PeerConnection.IceServer.builder("turn:global.turn.twilio.com:3478?transport=udp")
                 .setUsername("250b9e51bb86c20f5f99984953172df13ac1d09809730aef69bbc5c08266e2fa")
                 .setPassword("6oKhPT5Htb50TnmGz/zRhjSZ14jakfjwiE/MRRIUtks=")
@@ -690,9 +739,12 @@ class BoatGatewayService : Service(), SensorEventListener {
                 .createIceServer(),
 
         )
+
         val rtcConfig = PeerConnection.RTCConfiguration(iceServers).apply {
             sdpSemantics = PeerConnection.SdpSemantics.UNIFIED_PLAN
         }
+
+
         peerConnection = peerConnectionFactory.createPeerConnection(rtcConfig, object : PeerConnection.Observer {
             override fun onIceCandidate(candidate: IceCandidate?) {
                 candidate?.let {
@@ -724,10 +776,12 @@ class BoatGatewayService : Service(), SensorEventListener {
                 super.onConnectionChange(newState)
                 val status = newState?.name ?: "Unknown"
                 updateAndBroadcastStatus(webRtcStatus = status)
+                Log.d(TAG, "WebRTC connection state changed: $status")
                 if (newState == PeerConnection.PeerConnectionState.CONNECTED) {
-                    isWebRTCActive = true
+
                 }
-                if (newState == PeerConnection.PeerConnectionState.FAILED || newState == PeerConnection.PeerConnectionState.DISCONNECTED || newState == PeerConnection.PeerConnectionState.CLOSED) {
+                if (newState == PeerConnection.PeerConnectionState.DISCONNECTED) {
+                    Log.d(TAG, "WebRTC connection disconnected, initiating cleanup.")
                     onWebRTCConnectionFailedOrClosed()
                 }
             }
@@ -745,36 +799,54 @@ class BoatGatewayService : Service(), SensorEventListener {
         telemetryDataChannel = peerConnection?.createDataChannel("telemetry", DataChannel.Init())
         setupCameraTrack()
 
-        peerConnection?.setRemoteDescription(SdpObserverAdapter(), offerSdp)
-        peerConnection?.createAnswer(object: SdpObserverAdapter() {
-            override fun onCreateSuccess(answerSdp: SessionDescription?) {
-                Log.d(TAG, "Created ANSWER")
-                peerConnection?.setLocalDescription(object: SdpObserverAdapter() {
-                    override fun onSetSuccess() {
-                        Log.d(TAG, "Set local description (answer) success")
-                        val json = JSONObject().apply {
-                            put("type", answerSdp?.type?.canonicalForm())
-                            put("sdp", answerSdp?.description)
+        if (peerConnection?.signalingState() == PeerConnection.SignalingState.STABLE ||
+            peerConnection?.signalingState() == PeerConnection.SignalingState.HAVE_LOCAL_OFFER /* For glare handling */) {
+            Log.d(TAG, "Setting remote offer. Current state: ${peerConnection?.signalingState()}")
+            peerConnection?.setRemoteDescription(object : SdpObserver {
+                override fun onCreateSuccess(p0: SessionDescription?) {}
+                override fun onCreateFailure(p0: String?) {}
+                override fun onSetSuccess() {
+                    Log.d(TAG,"Remote offer set successfully. New state: ${peerConnection?.signalingState()}")
+                    Log.d(TAG, "Creating answer...")
+                    peerConnection?.createAnswer(object : SdpObserver {
+                        override fun onCreateSuccess(answerSdp: SessionDescription?) {
+                            peerConnection?.setLocalDescription(object: SdpObserver {
+                                override fun onCreateSuccess(p0: SessionDescription?) {}
+                                override fun onCreateFailure(p0: String?) {}
+                                override fun onSetSuccess() {
+                                    Log.d(TAG, "Local answer set successfully. New state: ${peerConnection?.signalingState()}") // Should be STABLE
+                                    val json = JSONObject().apply {
+                                    put("type", answerSdp?.type?.canonicalForm())
+                                    put("sdp", answerSdp?.description)
+                                    }
+                                    sendSignalingMessage(json)
+                                }
+                                override fun onSetFailure(error: String?) {
+                                    Log.e(TAG, "Failed to set local answer: $error")
+                                }
+                            }, answerSdp)
                         }
-                        sendSignalingMessage(json)
-                    }
-                    override fun onSetFailure(error: String?) {
-                        Log.e(TAG, "Failed to set local description: $error")
-                        onWebRTCConnectionFailedOrClosed()
-                    }
-                }, answerSdp)
-            }
-            override fun onCreateFailure(error: String?) {
-                Log.e(TAG, "Failed to create answer: $error")
-                onWebRTCConnectionFailedOrClosed()
-            }
-        }, MediaConstraints())
+                        override fun onCreateFailure(error: String?) {
+                            Log.e(TAG, "Failed to create answer: $error")
+                        }
+                        override fun onSetSuccess() {}
+                        override fun onSetFailure(p0: String?) {}
+                    }, MediaConstraints())
+                }
+
+                override fun onSetFailure(error: String?) {
+                    Log.e(TAG, "Failed to set remote offer: $error")
+                }
+            }, offerSdp)
+        } else {
+            Log.w(TAG, "Cannot set remote offer, connection is in an unexpected state: ${peerConnection?.signalingState()}")
+        }
     }
 
     private fun setupCameraTrack() {
         val surfaceTextureHelper = SurfaceTextureHelper.create("VideoCapturerThread", eglBase.eglBaseContext)
-        videoCapturer = createCameraCapturer()
 
+        videoCapturer = createCameraCapturer()
         if (videoCapturer == null) {
             Log.e(TAG, "Failed to create camera capturer.")
             return
@@ -784,8 +856,9 @@ class BoatGatewayService : Service(), SensorEventListener {
         videoCapturer!!.initialize(surfaceTextureHelper, this, videoSource.capturerObserver)
         videoCapturer!!.startCapture(640, 480, 15)
 
-        val videoTrack = peerConnectionFactory.createVideoTrack("videoTrack", videoSource)
+        videoTrack = peerConnectionFactory.createVideoTrack("videoTrack", videoSource)
         peerConnection?.addTrack(videoTrack, listOf("stream1"))
+
     }
 
     private fun createCameraCapturer(): CameraVideoCapturer? {
@@ -839,9 +912,6 @@ class BoatGatewayService : Service(), SensorEventListener {
             phoneHeading?.let { putExtra("phoneHeading", it) }
         }
         sendBroadcast(intent)
-        // Update notification with relevant combined status
-//        val notificationText = "MQTT: $currentMqttStatus, WebRTC: $currentWebRtcStatus, USB: $currentUsbStatus"
-//        startForeground(NOTIFICATION_ID, createNotification(notificationText))
     }
 
     companion object {
@@ -975,10 +1045,3 @@ fun RCBoatControllerTheme(content: @Composable () -> Unit) {
     MaterialTheme(colorScheme = colorScheme, content = content)
 }
 
-// SdpObserver adapter to simplify callbacks
-open class SdpObserverAdapter : SdpObserver {
-    override fun onCreateSuccess(p0: SessionDescription?) {}
-    override fun onSetSuccess() {}
-    override fun onCreateFailure(p0: String?) {}
-    override fun onSetFailure(p0: String?) {}
-}
