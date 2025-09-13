@@ -37,7 +37,9 @@ import com.google.android.gms.location.LocationServices
 import com.google.android.gms.location.Priority
 import com.google.android.gms.tasks.CancellationTokenSource
 import com.hivemq.client.mqtt.MqttClient
+import com.hivemq.client.mqtt.MqttClientBuilder
 import com.hivemq.client.mqtt.mqtt5.Mqtt5AsyncClient
+import com.hivemq.client.mqtt.mqtt5.Mqtt5ClientBuilder
 import com.hoho.android.usbserial.driver.UsbSerialDriver
 import com.hoho.android.usbserial.driver.UsbSerialPort
 import com.hoho.android.usbserial.driver.UsbSerialProber
@@ -53,6 +55,7 @@ import org.webrtc.*
 import java.nio.ByteBuffer
 import java.nio.charset.StandardCharsets
 import java.util.UUID
+import java.util.concurrent.TimeUnit
 
 
 // --- Main Activity: UI and Service Control ---
@@ -96,6 +99,7 @@ class BoatViewModel(application: Application) : AndroidViewModel(application) {
 
     private val _uiState = MutableStateFlow(UiState())
     val uiState = _uiState.asStateFlow()
+
 
     private val serviceUpdateReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context?, intent: Intent?) {
@@ -226,7 +230,7 @@ class BoatGatewayService : Service(), SensorEventListener {
         Log.d(TAG, "Stopping Gateway Service...")
         serviceJob?.cancel()
         disconnectUsb()
-        disconnectMqtt()
+//        disconnectMqtt()
         stopSensorListeners()
         initiateWebRTCCleanup()
 //        stopForeground(true)
@@ -320,43 +324,49 @@ class BoatGatewayService : Service(), SensorEventListener {
     }
 
     private fun connectMqtt() {
-        if (mqttClient?.state?.isConnectedOrReconnect == true) return
+        if (mqttClient?.state?.isConnectedOrReconnect == true) {
+            Log.i(TAG, "MQTT client already connected or reconnecting.")
+            updateAndBroadcastStatus(mqttStatus = "Connected")
+            return
+        }
+        Log.i(TAG, "Attempting to connect MQTT client...")
         updateAndBroadcastStatus(mqttStatus = "Connecting...")
 
-        mqttClient = MqttClient.builder()
+        var clientBuilder: Mqtt5ClientBuilder = MqttClient.builder()
             .useMqttVersion5()
             .identifier("BoatGateway-${UUID.randomUUID()}")
             .serverHost(BuildConfig.MQTT_BROKER_HOST)
             .serverPort(8883)
             .sslWithDefaultConfig()
-            .automaticReconnectWithDefaultConfig()
-            .addConnectedListener {
-                Log.d(TAG, "MQTT reconnected, sending hello.")
-                updateAndBroadcastStatus(mqttStatus = "Connected")
-                subscribeToSignaling()
-                sendSignalingMessage(JSONObject().put("type", "hello"))
-            }
-            .addDisconnectedListener {
-                Log.d(TAG, "MQTT disconnected.")
-                initiateWebRTCCleanup()
-            }
-            .buildAsync()
 
-        mqttClient?.connectWith()
-            ?.simpleAuth()
-            ?.username(BuildConfig.MQTT_USERNAME)
-            ?.password(BuildConfig.MQTT_PASSWORD.toByteArray())
-            ?.applySimpleAuth()
-            ?.send()
-            ?.whenComplete { _, throwable: Throwable? ->
-                if (throwable != null) {
-                    Log.w(TAG, "MQTT failed.")
-                    updateAndBroadcastStatus(mqttStatus = "Failed: ${throwable.message}")
-                } else {
-                    Log.d(TAG, "MQTT connected.")
-                    updateAndBroadcastStatus(mqttStatus = "Connected")
-                }
+        clientBuilder = clientBuilder.automaticReconnect()
+            .initialDelay(2, TimeUnit.SECONDS)
+            .maxDelay(5, TimeUnit.SECONDS)
+            .applyAutomaticReconnect()
+
+        clientBuilder = clientBuilder.addConnectedListener { context ->
+            Log.d(TAG, "MQTT reconnected, sending hello.")
+            updateAndBroadcastStatus(mqttStatus = "Connected")
+            subscribeToSignaling()
+            subscribeToGeneral()
+            sendSignalingMessage(JSONObject().put("type", "hello"))
             }
+
+        clientBuilder = clientBuilder.addDisconnectedListener { context ->
+            val cause = context.cause
+            Log.w(TAG, "MQTT client disconnected. Cause: $cause")
+            updateAndBroadcastStatus(mqttStatus = "Disconnected")
+            initiateWebRTCCleanup()
+        }
+
+        clientBuilder = clientBuilder.simpleAuth()
+            .username(BuildConfig.MQTT_USERNAME)
+            .password(BuildConfig.MQTT_PASSWORD.toByteArray())
+            .applySimpleAuth()
+
+        mqttClient = clientBuilder.buildAsync()
+
+        mqttClient?.connect()
     }
 
     private fun sendDataChannelTelemetry(topic: String, payload: String) {
@@ -556,6 +566,7 @@ class BoatGatewayService : Service(), SensorEventListener {
             Log.d(TAG, "Closing peer connection...")
             peerConnection?.close()
 
+
         } catch (e: Exception) {
             Log.e(TAG, "Error during WebRTC cleanup", e)
         } finally {
@@ -599,6 +610,28 @@ class BoatGatewayService : Service(), SensorEventListener {
                                 json.getString("candidate")
                             )
                             peerConnection?.addIceCandidate(candidate)
+                        }
+                    }
+                }
+            }
+            ?.send()
+    }
+
+    private fun subscribeToGeneral() {
+        mqttClient?.subscribeWith()
+            ?.topicFilter("rcboat/general")
+            ?.callback { publish ->
+                if (publish.payload.isPresent) {
+                    val message = StandardCharsets.UTF_8.decode(publish.payload.get()).toString()
+                    Log.d(TAG, "Received message: $message")
+                    val json = JSONObject(message)
+                    when {
+                        json.has("video") && json.getString("video") == "disable" -> {
+                            videoCapturer!!.stopCapture()
+                        }
+                        json.has("video") && json.getString("video") == "enable" -> {
+                            videoCapturer!!.startCapture(640, 480, 15)
+
                         }
                     }
                 }
